@@ -3,6 +3,9 @@ name = "arena"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 soroban-sdk = { workspace = true }
 
@@ -11,3 +14,5 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1"
 factory = { path = "../factory" }
 payout = { path = "../payout" }
+serde_json = "1"
+

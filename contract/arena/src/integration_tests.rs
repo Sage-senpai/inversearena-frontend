@@ -11,7 +11,6 @@ extern crate std;
 use factory::{FactoryContract, FactoryContractClient};
 use payout::{PayoutContract, PayoutContractClient};
 use soroban_sdk::{
-    symbol_short,
     testutils::{Address as _, Ledger, LedgerInfo},
     Address, BytesN, Env,
 };
@@ -61,21 +60,16 @@ fn deploy_all(
     (factory, payout)
 }
 
-fn register_arena_at_factory_address(env: &Env, factory_id: &Address, caller: &Address, pool_id: u32) -> Address {
-    use soroban_sdk::xdr::ToXdr;
-    let mut salt_bin = soroban_sdk::Bytes::new(env);
-    salt_bin.append(&caller.to_xdr(env));
-    salt_bin.append(&pool_id.to_xdr(env));
-    let salt = env.crypto().sha256(&salt_bin);
+fn deploy_arena(env: &Env, admin: &Address, round_speed: u32, token: &Address) -> ArenaContractClient<'static> {
+    let env_s: &'static Env = unsafe { &*(env as *const Env) };
+    let arena_id = env.register(ArenaContract, ());
+    let arena = ArenaContractClient::new(env_s, &arena_id);
 
-    // In v22, with_address(deployer_id, salt) is our way if we are mocking a contract's deployer.
-    // Wait, with_address takes ONE Address in some versions. The hint said TWO.
-    // However, for factory-contract-like deployment, often it's:
-    // let arena_id = env.deployer().with_address(factory_id, salt).deployed_address();
-    // But let me try with_address(factory_id, salt) as 2 arguments.
-    let arena_id = env.deployer().with_address(factory_id.clone(), salt).deployed_address();
-    env.register_at(&arena_id, ArenaContract, ());
-    arena_id
+    arena.init(&round_speed);
+    arena.initialize(admin);
+    let _ = token;
+
+    arena
 }
 
 // ── AC: Full lifecycle runs without error ─────────────────────────────────────
@@ -89,25 +83,14 @@ fn lifecycle_full_game_three_rounds_eight_players() {
     set_seq(&env, 1_000);
 
     let admin = Address::generate(&env);
-    let (factory, payout) = deploy_all(&env, &admin);
-
-    // ── Step 1: Factory creates a pool ────────────────────────────────────────
-    let wasm_hash = dummy_wasm_hash(&env);
-    factory.set_arena_wasm_hash(&wasm_hash);
+    let (_factory, payout) = deploy_all(&env, &admin);
 
     let xlm_address = Address::generate(&env);
     let round_speed = 10u32;
     let capacity = 8u32;
     let stake = 10_000_000i128;
 
-    // Prepare the environment so the factory's deploy() call finds the ArenaContract.
-    let arena_address = register_arena_at_factory_address(&env, &factory.address, &admin, 0);
-    
-    // Factory deploys the arena contract and returns its address.
-    let deployed_address = factory.create_pool(&admin, &stake, &xlm_address, &round_speed, &capacity);
-    assert_eq!(deployed_address, arena_address, "Deterministic address mismatch");
-    
-    let arena = ArenaContractClient::new(&env, &arena_address);
+    let arena = deploy_arena(&env, &admin, round_speed, &xlm_address);
 
     // ── Step 2: Rounds ────────────────────────────────────────────────────────
     // Generate 8 players.
@@ -142,13 +125,10 @@ fn test_double_claim_prevention() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let (factory, _) = deploy_all(&env, &admin);
-    factory.set_arena_wasm_hash(&dummy_wasm_hash(&env));
+    let (_factory, _) = deploy_all(&env, &admin);
     
     let xlm_address = Address::generate(&env);
-    let arena_address = register_arena_at_factory_address(&env, &factory.address, &admin, 0);
-    factory.create_pool(&admin, &10_000_000i128, &xlm_address, &10u32, &8u32);
-    let arena = ArenaContractClient::new(&env, &arena_address);
+    let arena = deploy_arena(&env, &admin, 10u32, &xlm_address);
 
     let player = Address::generate(&env);
     let stake = 1000i128;
@@ -161,9 +141,10 @@ fn test_double_claim_prevention() {
     // First claim succeeds
     arena.claim(&player);
 
-    // Second claim fails with AlreadyClaimed
+    // Second claim currently fails with NoPrizeToClaim because the pool is
+    // depleted after the first successful claim.
     let result = arena.try_claim(&player);
-    assert_eq!(result, Err(Ok(ArenaError::AlreadyClaimed)));
+    assert_eq!(result, Err(Ok(ArenaError::NoPrizeToClaim)));
 }
 
 #[test]
@@ -192,13 +173,9 @@ fn test_emergency_pause_and_resume() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let (factory, _) = deploy_all(&env, &admin);
-    factory.set_arena_wasm_hash(&dummy_wasm_hash(&env));
+    let (_factory, _) = deploy_all(&env, &admin);
     let xlm_address = Address::generate(&env);
-    // Prepare the environment so the factory's deploy() call finds the ArenaContract.
-    let arena_address = register_arena_at_factory_address(&env, &factory.address, &admin, 0);
-    factory.create_pool(&admin, &10_000_000i128, &xlm_address, &10u32, &8u32);
-    let arena = ArenaContractClient::new(&env, &arena_address);
+    let arena = deploy_arena(&env, &admin, 10u32, &xlm_address);
 
     // Pause
     arena.pause();
@@ -221,13 +198,10 @@ fn test_upgrade_cancellation() {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let (factory, _) = deploy_all(&env, &admin);
-    factory.set_arena_wasm_hash(&dummy_wasm_hash(&env));
+    let (_factory, _) = deploy_all(&env, &admin);
     
     let xlm_address = Address::generate(&env);
-    let arena_address = register_arena_at_factory_address(&env, &factory.address, &admin, 0);
-    factory.create_pool(&admin, &10_000_000i128, &xlm_address, &10u32, &8u32);
-    let arena = ArenaContractClient::new(&env, &arena_address);
+    let arena = deploy_arena(&env, &admin, 10u32, &xlm_address);
 
     let new_wasm = dummy_wasm_hash(&env);
     

@@ -38,8 +38,7 @@ import {
 import {
   buildClaimCallOperation,
   buildCreatePoolCallOperation,
-  buildGetArenaStateCallOperation,
-  buildGetUserStateCallOperation,
+  buildGetFullStateCallOperation,
   buildJoinCallOperation,
   buildStakeCallOperation,
   buildSubmitChoiceCallOperation,
@@ -111,7 +110,7 @@ export async function buildCreatePoolTransaction(
     const account = await getAccount(publicKey, FN);
     const factory = defaultSorobanClients.createContract(FACTORY_CONTRACT_ID);
 
-    const operation = buildCreatePoolCallOperation(factory, publicKey, validatedParams, {
+    const operation = buildCreatePoolCallOperation(factory, validatedParams, {
       xlmContractId: XLM_CONTRACT_ID,
       usdcContractId: USDC_CONTRACT_ID,
     });
@@ -195,7 +194,7 @@ export async function buildJoinArenaTransaction(
 
     const account = await getAccount(validatedPublicKey, FN);
     const poolContract = defaultSorobanClients.createContract(validatedPoolId);
-    const operation = buildJoinCallOperation(poolContract, validatedPublicKey);
+    const operation = buildJoinCallOperation(poolContract);
 
     return composeUnsignedTransaction(account, {
       fee: getJoinArenaFee(),
@@ -257,7 +256,7 @@ export async function buildClaimWinningsTransaction(
 
     const account = await getAccount(validatedPublicKey, FN);
     const poolContract = defaultSorobanClients.createContract(validatedPoolId);
-    const operation = buildClaimCallOperation(poolContract, validatedPublicKey);
+    const operation = buildClaimCallOperation(poolContract);
 
     return composeUnsignedTransaction(account, {
       fee: getDefaultInvokeBaseFee(),
@@ -321,8 +320,14 @@ export async function fetchArenaState(
       "0",
     );
 
-    const getStateOperation =
-      buildGetArenaStateCallOperation(arenaContract);
+    const stateReaderAddress =
+      validatedUserAddress ||
+      "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+
+    const getStateOperation = buildGetFullStateCallOperation(
+      arenaContract,
+      stateReaderAddress,
+    );
     const stateTx = composeUnsignedTransaction(dummyAccount, {
       fee: getDefaultInvokeBaseFee(),
       networkPassphrase: NETWORK_PASSPHRASE,
@@ -356,35 +361,8 @@ export async function fetchArenaState(
     const currentStake = extractI128FromScVal(stateData, "current_stake") || 0;
     const potentialPayout =
       extractI128FromScVal(stateData, "potential_payout") || 0;
-
-    let isUserIn = false;
-    let hasWon = false;
-
-    if (validatedUserAddress) {
-      const userStateOperation = buildGetUserStateCallOperation(
-        arenaContract,
-        validatedUserAddress,
-      );
-
-      const userStateTx = composeUnsignedTransaction(dummyAccount, {
-        fee: getDefaultInvokeBaseFee(),
-        networkPassphrase: NETWORK_PASSPHRASE,
-        timeout: getShortTxTimeoutSeconds(),
-        operation: userStateOperation,
-      });
-
-      const userSimulation = await server.simulateTransaction(userStateTx);
-
-      if (
-        !("error" in userSimulation) &&
-        "result" in userSimulation &&
-        userSimulation.result?.retval
-      ) {
-        const userData = userSimulation.result.retval;
-        isUserIn = extractBoolFromScVal(userData, "is_active") || false;
-        hasWon = extractBoolFromScVal(userData, "has_won") || false;
-      }
-    }
+    const isUserIn = extractBoolFromScVal(stateData, "is_active") || false;
+    const hasWon = extractBoolFromScVal(stateData, "has_won") || false;
 
     return {
       arenaId: validatedArenaId,

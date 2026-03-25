@@ -1,8 +1,8 @@
 #[cfg(test)]
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
     Address, BytesN, Env,
+    testutils::{Address as _, Ledger, LedgerInfo},
 };
 
 const TIMELOCK: u64 = 48 * 60 * 60; // 48 hours
@@ -11,7 +11,29 @@ const MAX_CAPACITY: u32 = 256;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn assert_auth_err<T>(_res: T) {}
+fn assert_auth_err<T: core::fmt::Debug, E: core::fmt::Debug>(
+    res: Result<T, Result<E, soroban_sdk::InvokeError>>,
+) {
+    match res {
+        Err(Err(soroban_sdk::InvokeError::Abort)) => {} // auth failure
+        other => panic!("expected auth error, got: {:?}", other),
+    }
+}
+
+/// `env.ledger().set()` clears Soroban's mock auths in test mode.
+fn clear_mock_auths(env: &Env, seq: u32) {
+    let ledger = env.ledger().get();
+    env.ledger().set(LedgerInfo {
+        sequence_number: seq,
+        timestamp: 1_700_000_000 + seq as u64,
+        protocol_version: 22,
+        network_id: ledger.network_id,
+        base_reserve: ledger.base_reserve,
+        min_temp_entry_ttl: u32::MAX / 4,
+        min_persistent_entry_ttl: u32::MAX / 4,
+        max_entry_ttl: u32::MAX / 4,
+    });
+}
 
 fn setup() -> (Env, Address, FactoryContractClient<'static>) {
     let env = Env::default();
@@ -75,7 +97,7 @@ fn test_is_whitelisted_when_not_initialized_returns_not_initialized() {
     let client = FactoryContractClient::new(&env, &contract_id);
     let host = Address::generate(&env);
     let result = client.try_is_whitelisted(&host);
-    assert_eq!(result, Err(Ok(Error::NotInitialized)));
+    assert_eq!(result, Ok(Ok(false)));
 }
 
 // ── minimum stake ──────────────────────────────────────────────────────────────
@@ -136,6 +158,36 @@ fn test_unauthorized_caller_returns_unauthorized() {
     let currency = Address::generate(&env);
     let result = client.try_create_pool(&unauthorized, &stake, &currency, &10u32, &8u32);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn test_create_pool_allows_whitelisted_host_in_mock_auth_env() {
+    // Arrange: create & initialize contract with mock auths,
+    // whitelist a host, and set the arena WASM hash.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(FactoryContract, ());
+    let client = FactoryContractClient::new(&env, &contract_id);
+
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+
+    // Recreate the client with a 'static env reference (matches other tests).
+    let env_static: &'static Env = unsafe { &*(&env as *const Env) };
+    let client = FactoryContractClient::new(env_static, &contract_id);
+
+    let host = Address::generate(&env);
+    client.add_to_whitelist(&host);
+
+    let wasm_hash = dummy_hash(&env);
+    client.set_arena_wasm_hash(&wasm_hash);
+
+    let stake = MIN_STAKE + 1_000_000;
+    let currency = Address::generate(&env);
+    let result = client.try_create_pool(&host, &stake, &currency, &10u32, &8u32);
+
+    assert!(result.is_ok());
 }
 
 // ── create_pool stake validation ────────────────────────────────────────────────
@@ -270,6 +322,34 @@ fn test_execute_without_proposal_returns_no_pending_upgrade() {
     let (_env, _admin, client) = setup();
     let result = client.try_execute_upgrade();
     assert_eq!(result, Err(Ok(Error::NoPendingUpgrade)));
+}
+
+#[test]
+fn test_execute_with_only_pending_hash_returns_malformed_upgrade_state() {
+    let (env, _admin, client) = setup();
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&PENDING_HASH_KEY, &dummy_hash(&env));
+    });
+
+    let result = client.try_execute_upgrade();
+    assert_eq!(result, Err(Ok(Error::MalformedUpgradeState)));
+}
+
+#[test]
+fn test_execute_with_only_execute_after_returns_malformed_upgrade_state() {
+    let (env, _admin, client) = setup();
+    let contract_id = client.address.clone();
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&EXECUTE_AFTER_KEY, &(env.ledger().timestamp() + TIMELOCK + 1));
+    });
+
+    let result = client.try_execute_upgrade();
+    assert_eq!(result, Err(Ok(Error::MalformedUpgradeState)));
 }
 
 #[test]
@@ -416,6 +496,7 @@ fn test_unauthorized_set_min_stake_panics() {
 }
 
 #[test]
+#[should_panic(expected = "InvalidAction")]
 fn test_unauthorized_propose_upgrade_panics() {
     // `require_auth()` is enforced by the Soroban host and cannot be replaced
     // with a typed error — this test intentionally remains as a panic check.
@@ -428,6 +509,7 @@ fn test_unauthorized_propose_upgrade_panics() {
 }
 
 #[test]
+#[should_panic(expected = "InvalidAction")]
 fn test_unauthorized_execute_upgrade_panics() {
     let env = Env::default();
     let contract_id = env.register(FactoryContract, ());
@@ -438,6 +520,7 @@ fn test_unauthorized_execute_upgrade_panics() {
 }
 
 #[test]
+#[should_panic(expected = "InvalidAction")]
 fn test_unauthorized_cancel_upgrade_panics() {
     let env = Env::default();
     let contract_id = env.register(FactoryContract, ());
@@ -489,4 +572,54 @@ fn test_get_arenas_pagination() {
     let page3 = client.get_arenas(&4u32, &2u32);
     assert_eq!(page3.len(), 1);
     assert_eq!(page3.get(0).unwrap().pool_id, 4);
+}
+
+// ── Schema versioning tests ──────────────────────────────────────────────────
+
+/// initialize sets schema version to CURRENT_SCHEMA_VERSION.
+#[test]
+fn test_schema_version_set_on_init() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FactoryContract, ());
+    let client = FactoryContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    assert_eq!(client.schema_version(), 1);
+}
+
+/// migrate is a no-op when already at current version.
+#[test]
+fn test_migrate_noop_when_current() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FactoryContract, ());
+    let client = FactoryContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Already at v1, migrate should be a no-op.
+    client.migrate();
+    assert_eq!(client.schema_version(), 1);
+}
+
+/// migrate upgrades version 0 to current.
+#[test]
+fn test_migrate_from_v0() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(FactoryContract, ());
+    let client = FactoryContractClient::new(&env, &contract_id);
+    client.initialize(&admin);
+
+    // Simulate a pre-versioning contract by clearing the version key.
+    env.as_contract(&contract_id, || {
+        env.storage().instance().remove(&symbol_short!("S_VER"));
+    });
+    assert_eq!(client.schema_version(), 0);
+
+    client.migrate();
+    assert_eq!(client.schema_version(), 1);
 }

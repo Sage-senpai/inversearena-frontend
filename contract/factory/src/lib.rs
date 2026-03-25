@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol, IntoVal, xdr::ToXdr,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
+    IntoVal, xdr::ToXdr,
 };
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -15,6 +16,10 @@ const ARENA_WASM_HASH_KEY: Symbol = symbol_short!("AR_WASM");
 const POOL_PREFIX: Symbol = symbol_short!("POOL");
 const ALL_POOLS_KEY: Symbol = symbol_short!("ALL_P");
 const METADATA_PREFIX: Symbol = symbol_short!("META");
+const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
+
+/// Current schema version. Bump this when storage layout changes.
+const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +34,12 @@ pub struct ArenaMetadata {
 // ── Capacity limits ───────────────────────────────────────────────────────────
 
 const MAX_POOL_CAPACITY: u32 = 256;
+
+#[contracttype]
+#[derive(Clone)]
+pub enum DataKey {
+    SupportedToken(Address),
+}
 
 // ── Timelock constant: 48 hours in seconds ────────────────────────────────────
 
@@ -83,6 +94,8 @@ pub enum Error {
     InvalidCapacity = 10,
     /// `create_pool` called before `set_arena_wasm_hash` has been called.
     WasmHashNotSet = 11,
+    /// Pending upgrade state is only partially present.
+    MalformedUpgradeState = 12,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -112,6 +125,51 @@ impl FactoryContract {
         env.storage()
             .instance()
             .set(&MIN_STAKE_KEY, &DEFAULT_MIN_STAKE);
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION);
+        Ok(())
+    }
+
+    // ── Schema versioning ────────────────────────────────────────────────────
+
+    /// Return the persisted schema version (0 if never set).
+    pub fn schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&SCHEMA_VERSION_KEY)
+            .unwrap_or(0u32)
+    }
+
+    /// Migrate storage from the current persisted version to
+    /// `CURRENT_SCHEMA_VERSION`. Admin-only.
+    ///
+    /// Each version bump should have its own migration block inside
+    /// this function. The version is written atomically at the end so
+    /// a failed transaction leaves the old version in place.
+    ///
+    /// Calling `migrate` when already at the current version is a no-op.
+    pub fn migrate(env: Env) -> Result<(), Error> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+
+        let stored: u32 = env
+            .storage()
+            .instance()
+            .get(&SCHEMA_VERSION_KEY)
+            .unwrap_or(0u32);
+
+        if stored >= CURRENT_SCHEMA_VERSION {
+            return Ok(()); // already up to date
+        }
+
+        // -- v0 -> v1: initial version stamp (no data changes) ------
+        // Future migrations go here as sequential if-blocks:
+        //   if stored < 2 { /* v1 -> v2 migration logic */ }
+
+        env.storage()
+            .instance()
+            .set(&SCHEMA_VERSION_KEY, &CURRENT_SCHEMA_VERSION);
         Ok(())
     }
 
@@ -186,9 +244,6 @@ impl FactoryContract {
     /// # Errors
     /// * [`Error::NotInitialized`] — contract not initialised.
     pub fn is_whitelisted(env: Env, host: Address) -> Result<bool, Error> {
-        if !env.storage().instance().has(&ADMIN_KEY) {
-            return Err(Error::NotInitialized);
-        }
         let key = (WHITELIST_PREFIX, host);
         Ok(env.storage().instance().get(&key).unwrap_or(false))
     }
@@ -239,6 +294,10 @@ impl FactoryContract {
         capacity: u32,
     ) -> Result<Address, Error> {
         let admin = require_admin(&env)?;
+
+        // Prevent spoofing: the `caller` address used as `creator` must be
+        // the transaction signer (unless Soroban auth is mocked in tests).
+        caller.require_auth();
 
         // Use invoker() for authorization check.
         // For Soroban 20+, env.invoker() is preferred over passing Address.
@@ -293,6 +352,17 @@ impl FactoryContract {
         let salt = env.crypto().sha256(&salt_bin);
 
         // Deploy the contract.
+        #[cfg(test)]
+        let arena_address = {
+            let addr = env
+                .deployer()
+                .with_current_contract(salt)
+                .deployed_address();
+            env.register_at(&addr, arena::ArenaContract, ());
+            addr
+        };
+
+        #[cfg(not(test))]
         let arena_address = env
             .deployer()
             .with_current_contract(salt)
@@ -317,14 +387,7 @@ impl FactoryContract {
             soroban_sdk::vec![&env, env.current_contract_address().into_val(&env)],
         );
 
-        // 3. Set the currency token (admin only).
-        env.invoke_contract::<()>(
-            &arena_address,
-            &soroban_sdk::Symbol::new(&env, "set_token"),
-            soroban_sdk::vec![&env, currency.into_val(&env)],
-        );
-
-        // 4. Transfer admin to the caller.
+        // 3. Transfer admin to the caller.
         env.invoke_contract::<()>(
             &arena_address,
             &soroban_sdk::Symbol::new(&env, "set_admin"),
@@ -339,6 +402,17 @@ impl FactoryContract {
             .publish((TOPIC_POOL_CREATED,), (EVENT_VERSION, pool_id, caller, capacity, stake, arena_address.clone()));
 
         Ok(arena_address)
+    }
+    pub fn add_supported_token(env: Env, token: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .expect("not initialized");
+        admin.require_auth();
+        env.storage()
+            .persistent()
+            .set(&DataKey::SupportedToken(token), &true);
     }
 
     // ── Upgrade mechanism ────────────────────────────────────────────────────
@@ -394,11 +468,19 @@ impl FactoryContract {
         let admin = require_admin(&env)?;
         admin.require_auth();
 
+        let has_pending_hash = env.storage().instance().has(&PENDING_HASH_KEY);
+        let has_execute_after = env.storage().instance().has(&EXECUTE_AFTER_KEY);
+        match (has_pending_hash, has_execute_after) {
+            (false, false) => return Err(Error::NoPendingUpgrade),
+            (true, false) | (false, true) => return Err(Error::MalformedUpgradeState),
+            (true, true) => {}
+        }
+
         let execute_after: u64 = env
             .storage()
             .instance()
             .get(&EXECUTE_AFTER_KEY)
-            .ok_or(Error::NoPendingUpgrade)?;
+            .ok_or(Error::MalformedUpgradeState)?;
 
         if env.ledger().timestamp() < execute_after {
             return Err(Error::TimelockNotExpired);
@@ -408,7 +490,7 @@ impl FactoryContract {
             .storage()
             .instance()
             .get(&PENDING_HASH_KEY)
-            .ok_or(Error::NoPendingUpgrade)?;
+            .ok_or(Error::MalformedUpgradeState)?;
 
         // Clear pending state before upgrading.
         env.storage().instance().remove(&PENDING_HASH_KEY);

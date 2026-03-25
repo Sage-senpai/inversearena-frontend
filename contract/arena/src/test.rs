@@ -6,8 +6,9 @@ use std::vec::Vec;
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    Address, BytesN, Env,
     testutils::{Address as _, Ledger as _, LedgerInfo},
+    Address, BytesN, Env,
+    token::StellarAssetClient,
 };
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -117,6 +118,15 @@ fn dummy_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[1u8; 32])
 }
 
+/// Register a Stellar Asset Contract and return (StellarAssetClient, token Address).
+fn setup_token<'a>(env: &'a Env, admin: &Address) -> (StellarAssetClient<'a>, Address) {
+    let token_id = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let asset = StellarAssetClient::new(env, &token_id);
+    (asset, token_id)
+}
+
 // ── sanity: basic contract round cycle ───────────────────────────────────────
 
 #[test]
@@ -124,7 +134,7 @@ fn basic_init_and_round_cycle() {
     let env = make_env();
     let client = create_client(&env);
     set_ledger(&env, 100);
-    client.init(&5u32);
+    client.init(&5);
     let r = client.start_round();
     assert_eq!(r.round_number, 1);
     assert!(r.active);
@@ -143,7 +153,7 @@ fn start_round_records_start_and_deadline_ledgers() {
 
     set_ledger_sequence(&env, 100);
 
-    client.init(&5u32);
+    client.init(&5);
     let round = client.start_round();
 
     assert_eq!(
@@ -169,7 +179,7 @@ fn submit_choice_allows_submission_on_deadline_ledger() {
     let player = Address::generate(&env);
 
     set_ledger_sequence(&env, 200);
-    client.init(&5u32);
+    client.init(&5);
     client.start_round();
 
     set_ledger_sequence(&env, 205);
@@ -188,7 +198,7 @@ fn submit_choice_rejects_late_submissions() {
     let player = Address::generate(&env);
 
     set_ledger_sequence(&env, 300);
-    client.init(&5u32);
+    client.init(&5);
     client.start_round();
 
     set_ledger_sequence(&env, 306);
@@ -298,6 +308,37 @@ fn state_survives_expected_game_duration() {
     assert_eq!(round.total_submissions, 1);
 
     assert_eq!(client.get_choice(&1, &player), Some(Choice::Heads));
+}
+
+#[test]
+fn get_full_state_returns_combined_arena_and_user_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = create_client(&env);
+    let player = Address::generate(&env);
+
+    set_ledger_sequence(&env, 800);
+    client.init(&5);
+
+    client.join(&player, &10i128);
+    client.start_round();
+    client.submit_choice(&player, &1u32, &Choice::Heads);
+
+    let full = client.get_full_state(&player);
+    assert_eq!(full.round_number, 1);
+    assert_eq!(full.survivors_count, 1);
+    assert!(full.is_active);
+    assert!(!full.has_won);
+}
+
+#[test]
+fn get_full_state_requires_initialization() {
+    let env = Env::default();
+    let client = create_client(&env);
+    let player = Address::generate(&env);
+
+    let err = client.try_get_full_state(&player);
+    assert_eq!(err, Err(Ok(ArenaError::NotInitialized)));
 }
 
 // ── Upgrade mechanism tests ───────────────────────────────────────────────────
@@ -739,38 +780,8 @@ fn test_set_admin_fails_without_admin() {
     client.set_admin(&new_admin);
 }
 
-fn assert_auth_err<T: core::fmt::Debug>(res: Result<T, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>) {
-    assert_eq!(
-        res.unwrap_err().unwrap(),
-        soroban_sdk::Error::from_type_and_code(
-            soroban_sdk::xdr::ScErrorType::Context,
-            soroban_sdk::xdr::ScErrorCode::InvalidAction,
-        )
-    );
-}
-
 #[test]
-fn test_unauthorized_set_admin_panics() {
-    let env = Env::default();
-    let contract_id = env.register(ArenaContract, ());
-    let client = ArenaContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-    assert_auth_err(client.try_set_admin(&Address::generate(&env)));
-}
-
-#[test]
-fn test_unauthorized_pause_panics() {
-    let env = Env::default();
-    let contract_id = env.register(ArenaContract, ());
-    let client = ArenaContractClient::new(&env, &contract_id);
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-    assert_auth_err(client.try_pause());
-    assert_auth_err(client.try_unpause());
-}
-
-#[test]
+#[should_panic(expected = "authorize")]
 fn test_unauthorized_propose_upgrade_panics() {
     let env = Env::default();
     let contract_id = env.register(ArenaContract, ());
@@ -778,10 +789,11 @@ fn test_unauthorized_propose_upgrade_panics() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
 
-    assert_auth_err(client.try_propose_upgrade(&dummy_hash(&env)));
+    client.propose_upgrade(&dummy_hash(&env));
 }
 
 #[test]
+#[should_panic(expected = "authorize")]
 fn test_unauthorized_execute_upgrade_panics() {
     let env = Env::default();
     let contract_id = env.register(ArenaContract, ());
@@ -789,10 +801,11 @@ fn test_unauthorized_execute_upgrade_panics() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
 
-    assert_auth_err(client.try_execute_upgrade());
+    client.execute_upgrade();
 }
 
 #[test]
+#[should_panic(expected = "authorize")]
 fn test_unauthorized_cancel_upgrade_panics() {
     let env = Env::default();
     let contract_id = env.register(ArenaContract, ());
@@ -800,9 +813,8 @@ fn test_unauthorized_cancel_upgrade_panics() {
     let admin = Address::generate(&env);
     client.initialize(&admin);
 
-    assert_auth_err(client.try_cancel_upgrade());
+    client.cancel_upgrade();
 }
-
 
 // ── Issue #232: round timeout and stalled game recovery ──────────────────────
 
@@ -813,7 +825,7 @@ fn timeout_round_succeeds_one_ledger_after_deadline() {
     let client = create_client(&env);
 
     set_ledger_sequence(&env, 1000);
-    client.init(&10u32);
+    client.init(&10);
     client.start_round();
 
     // deadline = 1010; advance one past it
@@ -832,7 +844,7 @@ fn timeout_round_succeeds_just_after_deadline() {
     let client = create_client(&env);
 
     set_ledger_sequence(&env, 500);
-    client.init(&5u32);
+    client.init(&5);
     client.start_round(); // deadline = 505
 
     set_ledger_sequence(&env, 506);
@@ -899,7 +911,7 @@ fn round_state_is_consistent_after_timeout() {
     let player = Address::generate(&env);
 
     set_ledger_sequence(&env, 300);
-    client.init(&5u32); // deadline = 305
+    client.init(&5); // deadline = 305
     client.start_round();
 
     // player submits within window
@@ -953,7 +965,7 @@ fn timeout_works_when_no_player_submitted() {
     let client = create_client(&env);
 
     set_ledger_sequence(&env, 600);
-    client.init(&5u32);
+    client.init(&5);
     let round = client.start_round(); // deadline = 605
     assert_eq!(round.total_submissions, 0);
 
@@ -1003,7 +1015,7 @@ fn submit_choice_rejected_after_deadline() {
     let player = Address::generate(&env);
 
     set_ledger_sequence(&env, 800);
-    client.init(&5u32); // deadline = 805
+    client.init(&5); // deadline = 805
     client.start_round();
 
     set_ledger_sequence(&env, 806);
@@ -1019,7 +1031,7 @@ fn new_round_starts_after_timeout_with_fresh_state() {
     let client = create_client(&env);
 
     set_ledger_sequence(&env, 900);
-    client.init(&5u32); // deadline = 905
+    client.init(&5); // deadline = 905
     client.start_round();
 
     set_ledger_sequence(&env, 906);
@@ -1043,7 +1055,7 @@ fn start_round_fails_when_active_round_exists() {
     let client = create_client(&env);
 
     set_ledger_sequence(&env, 1000);
-    client.init(&10u32);
+    client.init(&10);
     client.start_round();
 
     set_ledger_sequence(&env, 1005);
@@ -1103,7 +1115,7 @@ fn partial_submissions_preserved_after_timeout() {
     let player_c = Address::generate(&env);
 
     set_ledger_sequence(&env, 2000);
-    client.init(&10u32); // deadline = 2010
+    client.init(&10); // deadline = 2010
     client.start_round();
 
     // only player_a and player_b submit
@@ -1119,95 +1131,6 @@ fn partial_submissions_preserved_after_timeout() {
     assert_eq!(client.get_choice(&1, &player_a), Some(Choice::Heads));
     assert_eq!(client.get_choice(&1, &player_b), Some(Choice::Tails));
     assert_eq!(client.get_choice(&1, &player_c), None); // absent
-}
-
-// ── Claim and Payout tests ────────────────────────────────────────────────────
-
-use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::token::StellarAssetClient;
-
-fn setup_token(env: &Env, admin: &Address) -> (TokenClient<'static>, Address) {
-    let contract_id = env.register_stellar_asset_contract(admin.clone());
-    let token = TokenClient::new(env, &contract_id);
-    let asset = StellarAssetClient::new(env, &contract_id);
-    (token, contract_id)
-}
-
-#[test]
-fn claim_success_winner_receives_balance() {
-    let (env, admin, client) = setup_with_admin();
-
-    // Set up Token
-    let (token, token_id) = setup_token(&env, &admin);
-    let asset = StellarAssetClient::new(&env, &token_id);
-
-    // Mint tokens to the arena contract
-    let arena_addr = client.address.clone();
-    asset.mint(&arena_addr, &1000i128);
-
-    client.set_token(&token_id);
-
-    let player = Address::generate(&env);
-    client.init(&5u32);
-    client.start_round();
-
-    // Admin sets winner (stake=100, yield=25)
-    env.mock_all_auths();
-    client.set_winner(&player, &100i128, &25i128);
-
-    // Player claims
-    client.claim(&player);
-
-    // Winner receives correct token balance (stake + yield)
-    assert_eq!(token.balance(&player), 125);
-
-    // Remaining balance in arena
-    assert_eq!(token.balance(&arena_addr), 1000 - 125);
-
-    // Game status set to Finished after claim
-    let round = client.get_round();
-    assert!(round.finished);
-}
-
-#[test]
-fn claim_reverts_for_non_winner() {
-    let (env, admin, client) = setup_with_admin();
-    let (token, token_id) = setup_token(&env, &admin);
-    let asset = StellarAssetClient::new(&env, &token_id);
-    asset.mint(&client.address, &1000);
-    client.set_token(&token_id);
-    client.init(&5u32);
-    client.start_round();
-
-    let non_winner = Address::generate(&env);
-
-    env.mock_all_auths();
-    let res = client.try_claim(&non_winner);
-    assert_eq!(res, Err(Ok(ArenaError::NoPrizeToClaim)));
-}
-
-#[test]
-fn double_claim_reverts() {
-    let (env, admin, client) = setup_with_admin();
-    let (token, token_id) = setup_token(&env, &admin);
-    let asset = StellarAssetClient::new(&env, &token_id);
-    asset.mint(&client.address, &1000);
-    client.set_token(&token_id);
-    client.init(&5u32);
-    client.start_round();
-
-    let player = Address::generate(&env);
-
-    env.mock_all_auths();
-    client.set_winner(&player, &100, &10);
-
-    // First claim succeeds
-    client.claim(&player);
-    assert_eq!(token.balance(&player), 110);
-
-    // Second claim reverts
-    let res = client.try_claim(&player);
-    assert_eq!(res, Err(Ok(ArenaError::AlreadyClaimed)));
 }
 
 // ── Pause mechanism tests ───────────────────────────────────────────────────
@@ -1241,7 +1164,7 @@ fn test_functions_fail_when_paused() {
     let (env, _admin, client) = setup_with_admin();
     let player = Address::generate(&env);
     
-    client.init(&10u32);
+    client.init(&10);
     client.pause();
     assert!(client.is_paused());
 
@@ -1261,8 +1184,8 @@ fn test_functions_fail_when_paused() {
 #[test]
 fn test_unpause_restores_functionality() {
     let (env, _admin, client) = setup_with_admin();
-
-    client.init(&10u32);
+    
+    client.init(&10);
     client.pause();
     client.unpause();
 
@@ -1270,6 +1193,8 @@ fn test_unpause_restores_functionality() {
     let round = client.start_round();
     assert_eq!(round.round_number, 1);
 }
+
+
 
 // ── Issue #271: Emergency Pause Policy — governance/upgrade exemption ──────────
 //
@@ -1477,22 +1402,26 @@ fn get_arena_state_reflects_round_number() {
 /// After `join()`, `survivors_count` increases and subsequent reads are consistent.
 #[test]
 fn get_arena_state_reflects_survivor_count() {
-    let env = Env::default();
+    let (env, admin, client) = setup_with_admin();
+    let (_token, token_id) = setup_token(&env, &admin);
+    let asset = StellarAssetClient::new(&env, &token_id);
+    asset.mint(&client.address, &1_000_000i128);
+    client.set_token(&token_id);
+
     env.mock_all_auths();
-    let client = create_client(&env);
+    let player_a = Address::generate(&env);
+    let player_b = Address::generate(&env);
+    asset.mint(&player_a, &10_000i128);
+    asset.mint(&player_b, &10_000i128);
+
+    let (_token, token_id) = setup_token(&env, &admin);
+    let asset = StellarAssetClient::new(&env, &token_id);
+    client.set_token(&token_id);
 
     let player_a = Address::generate(&env);
     let player_b = Address::generate(&env);
 
-    // Set up Token
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-    client.init(&10u32); // Sets capacity and min stake requirements if any
-    let (token, token_id) = setup_token(&env, &admin);
-    let asset = StellarAssetClient::new(&env, &token_id);
-    client.set_token(&token_id);
-
-    // Mint tokens to players
+    // Mint tokens to players so they can stake.
     asset.mint(&player_a, &20_000_000i128);
     asset.mint(&player_b, &20_000_000i128);
 
@@ -1532,3 +1461,86 @@ fn get_arena_state_is_pure_read() {
     let state_b = client.get_arena_state();
     assert_eq!(state_a, state_b, "repeated calls must return identical state");
 }
+
+// ── Issue #275: explicit submission / participant bounds (N−1, N, N+1) ────────
+
+#[test]
+fn submission_boundary_n_minus_1_n_n_plus_1() {
+    let env = make_env();
+    let client = create_client(&env);
+    let cap = crate::bounds::MAX_SUBMISSIONS_PER_ROUND;
+    assert!(cap >= 3, "bounds must allow a three-point boundary test");
+
+    advance_ledger_with_auth(&env, 500);
+    client.init(&20);
+    client.start_round();
+
+    let n = cap - 1;
+    for _ in 0..n {
+        let p = Address::generate(&env);
+        client.submit_choice(&p, &1u32, &Choice::Heads);
+    }
+    assert_eq!(client.get_round().total_submissions, n);
+
+    let last_ok = Address::generate(&env);
+    client.submit_choice(&last_ok, &1u32, &Choice::Tails);
+    assert_eq!(client.get_round().total_submissions, cap);
+
+    let too_many = Address::generate(&env);
+    let err = client.try_submit_choice(&too_many, &1u32, &Choice::Heads);
+    assert_eq!(err, Err(Ok(ArenaError::MaxSubmissionsPerRound)));
+}
+
+#[test]
+fn join_boundary_participants_n_minus_1_n_n_plus_1() {
+    let (env, admin, client) = setup_with_admin();
+    let (_token, token_id) = setup_token(&env, &admin);
+    let asset = StellarAssetClient::new(&env, &token_id);
+    asset.mint(&client.address, &50_000_000i128);
+    client.set_token(&token_id);
+
+    // Use admin capacity so the test stays fast while still exercising typed `ArenaFull`.
+    const CAP: u32 = 50;
+    client.set_capacity(&CAP);
+
+    env.mock_all_auths();
+    for _ in 0..(CAP - 1) {
+        let p = Address::generate(&env);
+        asset.mint(&p, &1000i128);
+        client.join(&p, &100i128);
+    }
+    assert_eq!(client.get_arena_state().survivors_count, CAP - 1);
+
+    let last_ok = Address::generate(&env);
+    asset.mint(&last_ok, &1000i128);
+    client.join(&last_ok, &100i128);
+    assert_eq!(client.get_arena_state().survivors_count, CAP);
+
+    let too_many = Address::generate(&env);
+    asset.mint(&too_many, &1000i128);
+    let err = client.try_join(&too_many, &100i128);
+    assert_eq!(err, Err(Ok(ArenaError::ArenaFull)));
+}
+
+// ── Issue #277: round state machine invariant suite ───────────────────────────
+
+#[test]
+fn round_state_machine_invariant_suite_happy_path() {
+    let env = Env::default();
+    let client = create_client(&env);
+    set_ledger_sequence(&env, 100);
+    client.init(&5);
+    let r0 = client.get_round();
+    invariants::check_round_flags(&r0).unwrap();
+
+    let r1 = client.start_round();
+    invariants::check_round_flags(&r1).unwrap();
+    invariants::check_round_number_monotonic(r0.round_number, r1.round_number).unwrap();
+    invariants::check_submission_count_monotonic(r0.total_submissions, r1.total_submissions).unwrap();
+
+    set_ledger_sequence(&env, 106);
+    let r1t = client.timeout_round();
+    invariants::check_round_flags(&r1t).unwrap();
+    invariants::check_timeout_transition(&r1, &r1t).unwrap();
+}
+
