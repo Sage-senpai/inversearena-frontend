@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     Address, BytesN, Env, Symbol, contract, contracterror, contractimpl, contracttype,
-    symbol_short, token,
+    symbol_short, token::{self, Client as TokenClient},
 };
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
@@ -38,6 +38,10 @@ const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
 const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
 const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
 const TOPIC_GAME_ENDED: Symbol = symbol_short!("G_END");
+
+/// Event payload version. Include in every event data tuple so consumers
+/// can detect schema changes without re-deploying indexers.
+const EVENT_VERSION: u32 = 1;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 
@@ -222,6 +226,17 @@ impl ArenaContract {
         let winner_data: Option<(i128, i128)> = storage(&env).get(&DataKey::Winner(player.clone()));
         match winner_data {
             Some((stake, yield_comp)) => {
+                // Effects: Mark as claimed and remove winner record BEFORE interaction.
+                storage(&env).set(&DataKey::Claimed(player.clone()), &true);
+                bump(&env, &DataKey::Claimed(player.clone()));
+                storage(&env).remove(&DataKey::Winner(player.clone()));
+
+                let mut round = get_round(&env)?;
+                round.finished = true;
+                storage(&env).set(&DataKey::Round, &round);
+                bump(&env, &DataKey::Round);
+
+                // Interactions: Perform the transfer.
                 let token: Address = env
                     .storage()
                     .instance()
@@ -231,14 +246,6 @@ impl ArenaContract {
 
                 let total_payout = stake + yield_comp;
                 token_client.transfer(&env.current_contract_address(), &player, &total_payout);
-
-                storage(&env).set(&DataKey::Claimed(player.clone()), &true);
-                bump(&env, &DataKey::Claimed(player.clone()));
-
-                let mut round = get_round(&env)?;
-                round.finished = true;
-                storage(&env).set(&DataKey::Round, &round);
-                bump(&env, &DataKey::Round);
 
                 Ok(())
             }
@@ -300,7 +307,7 @@ impl ArenaContract {
         let admin = Self::admin(env.clone());
         admin.require_auth();
         env.storage().instance().set(&PAUSED_KEY, &true);
-        env.events().publish((TOPIC_PAUSED,), ());
+        env.events().publish((TOPIC_PAUSED,), (EVENT_VERSION,));
     }
 
     /// Unpause the contract. Admin-only.
@@ -308,7 +315,7 @@ impl ArenaContract {
         let admin = Self::admin(env.clone());
         admin.require_auth();
         env.storage().instance().set(&PAUSED_KEY, &false);
-        env.events().publish((TOPIC_UNPAUSED,), ());
+        env.events().publish((TOPIC_UNPAUSED,), (EVENT_VERSION,));
     }
 
     /// Return whether the contract is paused.
@@ -696,7 +703,7 @@ impl ArenaContract {
             .set(&EXECUTE_AFTER_KEY, &execute_after);
 
         env.events()
-            .publish((TOPIC_UPGRADE_PROPOSED,), (new_wasm_hash, execute_after));
+            .publish((TOPIC_UPGRADE_PROPOSED,), (EVENT_VERSION, new_wasm_hash, execute_after));
     }
 
     /// Execute a previously proposed upgrade after the 48-hour timelock.
@@ -748,7 +755,7 @@ impl ArenaContract {
         env.storage().instance().remove(&EXECUTE_AFTER_KEY);
 
         env.events()
-            .publish((TOPIC_UPGRADE_EXECUTED,), new_wasm_hash.clone());
+            .publish((TOPIC_UPGRADE_EXECUTED,), (EVENT_VERSION, new_wasm_hash.clone()));
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
     }
@@ -788,7 +795,7 @@ impl ArenaContract {
         env.storage().instance().remove(&PENDING_HASH_KEY);
         env.storage().instance().remove(&EXECUTE_AFTER_KEY);
 
-        env.events().publish((TOPIC_UPGRADE_CANCELLED,), ());
+        env.events().publish((TOPIC_UPGRADE_CANCELLED,), (EVENT_VERSION,));
     }
 
     /// Return the pending WASM hash and the earliest execution timestamp,

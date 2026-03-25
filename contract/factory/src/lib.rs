@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Symbol,
-    Vec,
+    IntoVal, xdr::ToXdr,
 };
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -51,6 +51,10 @@ const TOPIC_UPGRADE_CANCELLED: Symbol = symbol_short!("UP_CANC");
 const TOPIC_POOL_CREATED: Symbol = symbol_short!("POOL_CRE");
 const TOPIC_HOST_WHITELISTED: Symbol = symbol_short!("WL_ADD");
 const TOPIC_HOST_REMOVED: Symbol = symbol_short!("WL_REM");
+
+/// Event payload version. Include in every event data tuple so consumers
+/// can detect schema changes without re-deploying indexers.
+const EVENT_VERSION: u32 = 1;
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 //
@@ -209,7 +213,7 @@ impl FactoryContract {
         admin.require_auth();
         let key = (WHITELIST_PREFIX, host.clone());
         env.storage().instance().set(&key, &true);
-        env.events().publish((TOPIC_HOST_WHITELISTED,), host);
+        env.events().publish((TOPIC_HOST_WHITELISTED,), (EVENT_VERSION, host));
         Ok(())
     }
 
@@ -223,7 +227,7 @@ impl FactoryContract {
         admin.require_auth();
         let key = (WHITELIST_PREFIX, host.clone());
         env.storage().instance().remove(&key);
-        env.events().publish((TOPIC_HOST_REMOVED,), host);
+        env.events().publish((TOPIC_HOST_REMOVED,), (EVENT_VERSION, host));
         Ok(())
     }
 
@@ -279,13 +283,15 @@ impl FactoryContract {
     pub fn create_pool(
         env: Env,
         caller: Address,
-        creator: Address,
-        pool_id: u32,
+        stake: i128,
+        currency: Address,
+        round_speed: u32,
         capacity: u32,
-        stake_amount: i128,
-    ) -> Result<(), Error> {
+    ) -> Result<Address, Error> {
         let admin = require_admin(&env)?;
 
+        // Use invoker() for authorization check.
+        // For Soroban 20+, env.invoker() is preferred over passing Address.
         let is_admin = caller == admin;
         let is_whitelisted = Self::is_whitelisted(env.clone(), caller.clone())?;
 
@@ -293,50 +299,96 @@ impl FactoryContract {
             return Err(Error::Unauthorized);
         }
 
-        let pool_key = (POOL_PREFIX, pool_id);
-        if env.storage().instance().has(&pool_key) {
-            return Err(Error::PoolAlreadyExists);
-        }
-
         if capacity == 0 || capacity > MAX_POOL_CAPACITY {
             return Err(Error::InvalidCapacity);
         }
 
         let min_stake = Self::get_min_stake(env.clone());
-        if stake_amount <= 0 {
+        if stake <= 0 {
             return Err(Error::InvalidStakeAmount);
         }
-        if stake_amount < min_stake {
+        if stake < min_stake {
             return Err(Error::StakeBelowMinimum);
         }
 
-        if !env.storage().instance().has(&ARENA_WASM_HASH_KEY) {
-            return Err(Error::WasmHashNotSet);
-        }
-
-        env.storage().instance().set(&pool_key, &true);
-
-        let metadata = ArenaMetadata {
-            pool_id,
-            creator: creator.clone(),
-            capacity,
-            stake_amount,
-        };
-        let meta_key = (METADATA_PREFIX, pool_id);
-        env.storage().instance().set(&meta_key, &metadata);
+        let wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&ARENA_WASM_HASH_KEY)
+            .ok_or(Error::WasmHashNotSet)?;
 
         let mut all_pools: soroban_sdk::Vec<u32> = env
             .storage()
             .instance()
             .get(&ALL_POOLS_KEY)
             .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+        let pool_id = all_pools.len();
+
+        let metadata = ArenaMetadata {
+            pool_id,
+            creator: caller.clone(),
+            capacity,
+            stake_amount: stake,
+        };
+        let meta_key = (METADATA_PREFIX, pool_id);
+        env.storage().instance().set(&meta_key, &metadata);
+
+        // ── Deployment ──────────────────────────────────────────────────────────
+
+
+        // Create a unique salt for this deployment.
+        let mut salt_bin = soroban_sdk::Bytes::new(&env);
+        salt_bin.append(&caller.clone().to_xdr(&env));
+        salt_bin.append(&pool_id.to_xdr(&env));
+        let salt = env.crypto().sha256(&salt_bin);
+
+        // Deploy the contract.
+        let arena_address = env
+            .deployer()
+            .with_current_contract(salt)
+            .deploy(wasm_hash);
+
+        // ── Initialisation ──────────────────────────────────────────────────────
+
+        // Use a generic client to call init and initialize.
+        // Note: In a real implementation, you'd use the generated client from the arena contract.
+        // For simplicity here, we use invoke_contract if we don't have the client imported.
+        // However, better to assume the workspace allows cross-contract calls.
+        
+        env.invoke_contract::<()>(
+            &arena_address,
+            &soroban_sdk::symbol_short!("init"),
+            soroban_sdk::vec![&env, round_speed.into_val(&env)],
+        );
+
+        env.invoke_contract::<()>(
+            &arena_address,
+            &soroban_sdk::Symbol::new(&env, "initialize"),
+            soroban_sdk::vec![&env, env.current_contract_address().into_val(&env)],
+        );
+
+        // 3. Set the currency token (admin only).
+        env.invoke_contract::<()>(
+            &arena_address,
+            &soroban_sdk::Symbol::new(&env, "set_token"),
+            soroban_sdk::vec![&env, currency.into_val(&env)],
+        );
+
+        // 4. Transfer admin to the caller.
+        env.invoke_contract::<()>(
+            &arena_address,
+            &soroban_sdk::Symbol::new(&env, "set_admin"),
+            soroban_sdk::vec![&env, caller.into_val(&env)],
+        );
+
+        // Register pool.
         all_pools.push_back(pool_id);
         env.storage().instance().set(&ALL_POOLS_KEY, &all_pools);
 
         env.events()
-            .publish((TOPIC_POOL_CREATED,), (pool_id, creator, capacity, stake_amount));
+            .publish((TOPIC_POOL_CREATED,), (EVENT_VERSION, pool_id, caller, capacity, stake, arena_address.clone()));
 
-        Ok(())
+        Ok(arena_address)
     }
 
     // ── Upgrade mechanism ────────────────────────────────────────────────────
@@ -369,7 +421,7 @@ impl FactoryContract {
             .set(&EXECUTE_AFTER_KEY, &execute_after);
 
         env.events()
-            .publish((TOPIC_UPGRADE_PROPOSED,), (new_wasm_hash, execute_after));
+            .publish((TOPIC_UPGRADE_PROPOSED,), (EVENT_VERSION, new_wasm_hash, execute_after));
         Ok(())
     }
 
@@ -413,7 +465,7 @@ impl FactoryContract {
         env.storage().instance().remove(&EXECUTE_AFTER_KEY);
 
         env.events()
-            .publish((TOPIC_UPGRADE_EXECUTED,), new_wasm_hash.clone());
+            .publish((TOPIC_UPGRADE_EXECUTED,), (EVENT_VERSION, new_wasm_hash.clone()));
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
@@ -444,49 +496,8 @@ impl FactoryContract {
         env.storage().instance().remove(&PENDING_HASH_KEY);
         env.storage().instance().remove(&EXECUTE_AFTER_KEY);
 
-        env.events().publish((TOPIC_UPGRADE_CANCELLED,), ());
+        env.events().publish((TOPIC_UPGRADE_CANCELLED,), (EVENT_VERSION,));
         Ok(())
-    }
-
-    // ── Query methods ─────────────────────────────────────────────────────
-
-    /// Return the metadata for a single arena by `pool_id`, or `None` if
-    /// no pool with that id exists.
-    pub fn get_arena(env: Env, pool_id: u32) -> Option<ArenaMetadata> {
-        let meta_key = (METADATA_PREFIX, pool_id);
-        env.storage().instance().get(&meta_key)
-    }
-
-    /// Return a page of arena metadata entries.
-    ///
-    /// * `offset` — number of entries to skip from the beginning.
-    /// * `limit`  — maximum number of entries to return.
-    pub fn get_arenas(env: Env, offset: u32, limit: u32) -> Vec<ArenaMetadata> {
-        let all_pools: Vec<u32> = env
-            .storage()
-            .instance()
-            .get(&ALL_POOLS_KEY)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut result = Vec::new(&env);
-        let len = all_pools.len();
-        let start = offset;
-        let end = if offset + limit > len {
-            len
-        } else {
-            offset + limit
-        };
-
-        let mut i = start;
-        while i < end {
-            let pool_id = all_pools.get(i).unwrap();
-            let meta_key = (METADATA_PREFIX, pool_id);
-            if let Some(meta) = env.storage().instance().get::<_, ArenaMetadata>(&meta_key) {
-                result.push_back(meta);
-            }
-            i += 1;
-        }
-        result
     }
 
     /// Return the pending WASM hash and the earliest execution timestamp,
@@ -501,6 +512,34 @@ impl FactoryContract {
             (Some(h), Some(a)) => Some((h, a)),
             _ => None,
         }
+    }
+
+    /// Get metadata for a specific pool.
+    pub fn get_arena(env: Env, pool_id: u32) -> Option<ArenaMetadata> {
+        let key = (METADATA_PREFIX, pool_id);
+        env.storage().instance().get(&key)
+    }
+
+    /// Get a paginated list of arena metadata.
+    pub fn get_arenas(env: Env, offset: u32, limit: u32) -> soroban_sdk::Vec<ArenaMetadata> {
+        let all_pools: soroban_sdk::Vec<u32> = env
+            .storage()
+            .instance()
+            .get(&ALL_POOLS_KEY)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+
+        let mut results = soroban_sdk::Vec::new(&env);
+        let start = offset;
+        let end = core::cmp::min(offset + limit, all_pools.len());
+
+        for i in start..end {
+            if let Some(pool_id) = all_pools.get(i) {
+                if let Some(meta) = Self::get_arena(env.clone(), pool_id) {
+                    results.push_back(meta);
+                }
+            }
+        }
+        results
     }
 }
 

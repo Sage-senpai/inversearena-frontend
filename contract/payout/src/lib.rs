@@ -6,7 +6,13 @@ use soroban_sdk::{
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const SCHEMA_VERSION_KEY: Symbol = symbol_short!("S_VER");
+const TREASURY_KEY: Symbol = symbol_short!("TREASURY");
 const TOPIC_PAYOUT_EXECUTED: Symbol = symbol_short!("PAYOUT");
+const TOPIC_DUST_COLLECTED: Symbol = symbol_short!("DUST");
+
+/// Event payload version. Include in every event data tuple so consumers
+/// can detect schema changes without re-deploying indexers.
+const EVENT_VERSION: u32 = 1;
 
 /// Current schema version. Bump this when storage layout changes.
 const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -30,12 +36,23 @@ pub enum PayoutError {
     InvalidAmount = 4,
     /// A payout for this `(idempotency_key, winner)` pair was already processed.
     AlreadyProcessed = 5,
+    /// No winners provided for prize distribution.
+    NoWinners = 6,
+    /// Treasury address not set.
+    TreasuryNotSet = 7,
 }
 
+/// Storage key for payout records.
+///
+/// The `context` field provides domain separation so the same payout
+/// contract can serve multiple arenas, tournaments, or game modes without
+/// risk of key collision. Callers choose the context (e.g. `"arena_1"`,
+/// `"tourney"`) and the contract guarantees uniqueness within each
+/// `(context, idempotency_key, winner)` triple.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    Payout(u32, Address),
+    Payout(Symbol, u32, Address),
 }
 
 #[contracterror]
@@ -49,7 +66,7 @@ pub enum Error {
 pub struct PayoutData {
     pub winner: Address,
     pub amount: i128,
-    pub currency: Symbol,
+    pub currency: Address,
     pub paid: bool,
 }
 
@@ -138,14 +155,33 @@ impl PayoutContract {
         require_admin(&env)
     }
 
+    /// Set the treasury address for collecting dust. Admin-only.
+    pub fn set_treasury(env: Env, treasury: Address) -> Result<(), PayoutError> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+        env.storage().instance().set(&TREASURY_KEY, &treasury);
+        Ok(())
+    }
+
+    /// Return the current treasury address.
+    pub fn treasury(env: Env) -> Result<Address, PayoutError> {
+        env.storage()
+            .instance()
+            .get(&TREASURY_KEY)
+            .ok_or(PayoutError::TreasuryNotSet)
+    }
+
     /// Distribute winnings to a winner. Admin-only.
     ///
-    /// Uses an `idempotency_key` to prevent double-pays: calling this function
-    /// twice with the same `(idempotency_key, winner)` pair is rejected.
+    /// Uses a `(context, idempotency_key, winner)` triple to prevent
+    /// double-pays. The `context` field provides domain separation so the
+    /// same payout contract can serve multiple arenas or game modes without
+    /// risk of key collision.
     ///
     /// # Arguments
     /// * `caller` - Must be the admin address.
-    /// * `idempotency_key` - Unique key scoped to `winner` preventing duplicate payouts.
+    /// * `context` - Domain namespace (e.g. `"arena_1"`, `"tourney"`).
+    /// * `idempotency_key` - Unique key within the context preventing duplicate payouts.
     /// * `winner` - Recipient address.
     /// * `amount` - Amount to pay; must be > 0.
     /// * `currency` - Currency symbol (e.g. `XLM`, `USDC`).
@@ -161,10 +197,11 @@ impl PayoutContract {
     pub fn distribute_winnings(
         env: Env,
         caller: Address,
+        context: Symbol,
         idempotency_key: u32,
         winner: Address,
         amount: i128,
-        currency: Symbol,
+        currency: Address,
     ) -> Result<(), PayoutError> {
         let admin = require_admin(&env)?;
 
@@ -176,7 +213,7 @@ impl PayoutContract {
             return Err(PayoutError::InvalidAmount);
         }
 
-        let payout_key = DataKey::Payout(idempotency_key, winner.clone());
+        let payout_key = DataKey::Payout(context, idempotency_key, winner.clone());
         if env
             .storage()
             .instance()
@@ -185,6 +222,9 @@ impl PayoutContract {
         {
             return Err(PayoutError::AlreadyProcessed);
         }
+
+        let token_client = soroban_sdk::token::Client::new(&env, &currency);
+        token_client.transfer(&env.current_contract_address(), &winner, &amount);
 
         let payout_data = PayoutData {
             winner: winner.clone(),
@@ -195,7 +235,48 @@ impl PayoutContract {
         env.storage().instance().set(&payout_key, &payout_data);
 
         env.events()
-            .publish((TOPIC_PAYOUT_EXECUTED,), (winner, amount, currency));
+            .publish((TOPIC_PAYOUT_EXECUTED,), (EVENT_VERSION, winner, amount, currency));
+
+        Ok(())
+    }
+
+    /// Distribute a prize pool among multiple winners with deterministic rounding.
+    /// Dust (remainder) is sent to the treasury.
+    pub fn distribute_prize(
+        env: Env,
+        total_prize: i128,
+        winners: soroban_sdk::Vec<Address>,
+        currency: Address,
+    ) -> Result<(), PayoutError> {
+        let admin = require_admin(&env)?;
+        admin.require_auth();
+
+        if winners.is_empty() {
+            return Err(PayoutError::NoWinners);
+        }
+
+        if total_prize <= 0 {
+            return Err(PayoutError::InvalidAmount);
+        }
+
+        let treasury = env.storage().instance().get(&TREASURY_KEY).ok_or(PayoutError::TreasuryNotSet)?;
+        let token_client = soroban_sdk::token::Client::new(&env, &currency);
+
+        let count = winners.len() as i128;
+        let share = total_prize / count;
+        let dust = total_prize % count;
+
+        // Transfer share to each winner.
+        for winner in winners.iter() {
+            token_client.transfer(&env.current_contract_address(), &winner, &share);
+            env.events().publish((TOPIC_PAYOUT_EXECUTED,), (winner, share, currency.clone()));
+        }
+
+        // Transfer dust to treasury.
+        if dust > 0 {
+            token_client.transfer(&env.current_contract_address(), &treasury, &dust);
+            env.events().publish((TOPIC_DUST_COLLECTED,), (treasury, dust, currency));
+        }
 
         Ok(())
     }
@@ -204,8 +285,8 @@ impl PayoutContract {
     ///
     /// # Authorization
     /// None — read-only, open to any caller.
-    pub fn is_payout_processed(env: Env, idempotency_key: u32, winner: Address) -> bool {
-        let payout_key = DataKey::Payout(idempotency_key, winner);
+    pub fn is_payout_processed(env: Env, context: Symbol, idempotency_key: u32, winner: Address) -> bool {
+        let payout_key = DataKey::Payout(context, idempotency_key, winner);
         env.storage()
             .instance()
             .get::<_, PayoutData>(&payout_key)
@@ -217,8 +298,8 @@ impl PayoutContract {
     ///
     /// # Authorization
     /// None — read-only, open to any caller.
-    pub fn get_payout(env: Env, idempotency_key: u32, winner: Address) -> Option<PayoutData> {
-        let payout_key = DataKey::Payout(idempotency_key, winner);
+    pub fn get_payout(env: Env, context: Symbol, idempotency_key: u32, winner: Address) -> Option<PayoutData> {
+        let payout_key = DataKey::Payout(context, idempotency_key, winner);
         env.storage().instance().get(&payout_key)
     }
 }
