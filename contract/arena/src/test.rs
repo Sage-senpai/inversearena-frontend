@@ -1666,6 +1666,39 @@ fn claim_already_claimed_returns_error() {
     assert_eq!(err, Err(Ok(ArenaError::AlreadyClaimed)));
 }
 
+#[test]
+fn join_rejects_after_game_is_finished() {
+    let (env, admin, client) = setup_with_admin();
+    let (asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+
+    let winner = Address::generate(&env);
+    client.set_winner(&winner, &600i128, &400i128);
+    asset.mint(&client.address, &1_000i128);
+    client.claim(&winner);
+
+    let player = Address::generate(&env);
+    asset.mint(&player, &100i128);
+    let err = client.try_join(&player, &100i128);
+    assert_eq!(err, Err(Ok(ArenaError::GameAlreadyFinished)));
+}
+
+#[test]
+fn start_round_rejects_after_game_is_finished() {
+    let (env, admin, client) = setup_with_admin();
+    let (asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+
+    client.init(&5);
+    let winner = Address::generate(&env);
+    client.set_winner(&winner, &600i128, &400i128);
+    asset.mint(&client.address, &1_000i128);
+    client.claim(&winner);
+
+    let err = client.try_start_round();
+    assert_eq!(err, Err(Ok(ArenaError::GameAlreadyFinished)));
+}
+
 // ── Issue #XXX: join() CEI ordering and retry after failed join ───────────────
 
 #[test]

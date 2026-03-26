@@ -19,6 +19,7 @@ const CAPACITY_KEY: Symbol = symbol_short!("CAPACITY");
 const TOKEN_KEY: Symbol = symbol_short!("TOKEN");
 const PRIZE_POOL_KEY: Symbol = symbol_short!("PRIZE_P");
 const GAME_STATUS_KEY: Symbol = symbol_short!("G_STATUS");
+const GAME_FINISHED_KEY: Symbol = symbol_short!("G_FIN");
 
 // ── Timelock: 48 hours in seconds ─────────────────────────────────────────────
 const TIMELOCK_PERIOD: u64 = 48 * 60 * 60;
@@ -264,6 +265,14 @@ impl ArenaContract {
     pub fn join(env: Env, player: Address, amount: i128) -> Result<(), ArenaError> {
         player.require_auth();
         require_not_paused(&env)?;
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&GAME_FINISHED_KEY)
+            .unwrap_or(false)
+        {
+            return Err(ArenaError::GameAlreadyFinished);
+        }
         if amount <= 0 {
             return Err(ArenaError::InvalidAmount);
         }
@@ -314,6 +323,14 @@ impl ArenaContract {
 
     pub fn start_round(env: Env) -> Result<RoundState, ArenaError> {
         require_not_paused(&env)?;
+        if env
+            .storage()
+            .instance()
+            .get::<_, bool>(&GAME_FINISHED_KEY)
+            .unwrap_or(false)
+        {
+            return Err(ArenaError::GameAlreadyFinished);
+        }
         env.storage()
             .instance()
             .extend_ttl(GAME_TTL_THRESHOLD, GAME_TTL_EXTEND_TO);
@@ -426,6 +443,7 @@ impl ArenaContract {
         env.storage().instance().set(&PRIZE_POOL_KEY, &0i128);
         token::Client::new(&env, &token).transfer(&env.current_contract_address(), &winner, &prize);
         env.storage().instance().set(&GAME_STATUS_KEY, &false);
+        env.storage().instance().set(&GAME_FINISHED_KEY, &true);
         // Mark round as finished after prize is claimed
         if let Some(mut round) = storage(&env).get::<_, RoundState>(&DataKey::Round) {
             round.finished = true;
