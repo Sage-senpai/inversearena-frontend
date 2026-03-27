@@ -160,6 +160,18 @@ Replace `init`, argument names, and types with your contract’s actual interfac
 3. Run init calls per contract.
 4. Register addresses in the frontend env (next section).
 
+### Factory-created arenas
+
+`factory.create_pool(...)` now performs the arena bootstrap needed for a usable pool in one transaction:
+
+1. deploy the arena contract
+2. call `init(round_speed)`
+3. call `initialize(factory_address)`
+4. call `set_token(currency)`
+5. transfer arena admin to the caller with `set_admin(caller)`
+
+That means a newly created arena is immediately joinable; no manual post-creation `set_token()` call is required anymore.
+
 ---
 
 ## 5. Deploy (mainnet)

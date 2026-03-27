@@ -387,7 +387,13 @@ impl FactoryContract {
             soroban_sdk::vec![&env, env.current_contract_address().into_val(&env)],
         );
 
-        // 3. Transfer admin to the caller.
+        env.invoke_contract::<()>(
+            &arena_address,
+            &soroban_sdk::Symbol::new(&env, "set_token"),
+            soroban_sdk::vec![&env, currency.into_val(&env)],
+        );
+
+        // 3. Transfer admin to the caller after factory-owned initialization is complete.
         env.invoke_contract::<()>(
             &arena_address,
             &soroban_sdk::Symbol::new(&env, "set_admin"),

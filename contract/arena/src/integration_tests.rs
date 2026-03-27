@@ -15,7 +15,7 @@ use payout::{PayoutContract, PayoutContractClient};
 use soroban_sdk::{
     Address, BytesN, Env,
     testutils::{Address as _, Ledger, LedgerInfo},
-    token::StellarAssetClient,
+    token::{StellarAssetClient, TokenClient},
 };
 
 use super::*;
@@ -154,6 +154,93 @@ fn lifecycle_full_game_three_rounds_eight_players() {
         &prize_amount,
         &soroban_sdk::vec![&env, winner.clone()],
         &xlm_address,
+    );
+}
+
+#[test]
+fn lifecycle_full_game_resolve_round_to_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+    set_seq(&env, 2_000);
+
+    let admin = Address::generate(&env);
+    let (_factory, payout) = deploy_all(&env, &admin);
+
+    let token_admin = Address::generate(&env);
+    let token_id = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = StellarAssetClient::new(&env, &token_id);
+    let token_reader = TokenClient::new(&env, &token_id);
+    let stake = 10_000_000i128;
+
+    let arena = deploy_arena(&env, &admin, 5, &token_id);
+
+    let players: std::vec::Vec<Address> = (0..8).map(|_| Address::generate(&env)).collect();
+    join_players(&env, &arena, &token, &players, stake);
+
+    set_seq(&env, 2_010);
+    let round_one = arena.start_round();
+    assert_eq!(round_one.round_number, 1);
+
+    for player in &players[0..5] {
+        arena.submit_choice(player, &1, &Choice::Heads);
+    }
+    for player in &players[5..8] {
+        arena.submit_choice(player, &1, &Choice::Tails);
+    }
+
+    set_seq(&env, 2_016);
+    arena.resolve_round();
+    assert_eq!(arena.get_arena_state().survivors_count, 3);
+
+    let eliminated_round_one = players[0].clone();
+    assert_eq!(
+        arena.try_submit_choice(&eliminated_round_one, &1, &Choice::Heads),
+        Err(Ok(ArenaError::PlayerEliminated))
+    );
+
+    set_seq(&env, 2_020);
+    let round_two = arena.start_round();
+    assert_eq!(round_two.round_number, 2);
+
+    arena.submit_choice(&players[5], &2, &Choice::Heads);
+    arena.submit_choice(&players[6], &2, &Choice::Heads);
+    arena.submit_choice(&players[7], &2, &Choice::Tails);
+
+    set_seq(&env, 2_026);
+    arena.resolve_round();
+    assert_eq!(arena.get_arena_state().survivors_count, 1);
+
+    let winner = players[7].clone();
+    assert_eq!(
+        arena.try_submit_choice(&players[5], &2, &Choice::Heads),
+        Err(Ok(ArenaError::PlayerEliminated))
+    );
+
+    let total_prize = stake * players.len() as i128;
+    arena.set_winner(&winner, &total_prize, &0i128);
+    let winner_balance_before_claim = token_reader.balance(&winner);
+    let claimed = arena.claim(&winner);
+    assert_eq!(claimed, total_prize);
+    assert_eq!(
+        token_reader.balance(&winner),
+        winner_balance_before_claim + total_prize
+    );
+
+    payout.set_treasury(&admin);
+    let bonus_prize = 90i128;
+    token.mint(&payout.address, &bonus_prize);
+    let winner_balance_before_bonus = token_reader.balance(&winner);
+    payout.distribute_prize(
+        &42u32,
+        &bonus_prize,
+        &soroban_sdk::vec![&env, winner.clone()],
+        &token_id,
+    );
+    assert_eq!(
+        token_reader.balance(&winner),
+        winner_balance_before_bonus + bonus_prize
     );
 }
 

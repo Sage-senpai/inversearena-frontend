@@ -39,6 +39,7 @@ File: `contract/arena/src/lib.rs`
 | `DataKey::Round` | `RoundState` | Active round state (number, ledgers, submission count, flags) |
 | `DataKey::Submission(round_number, player)` | `Choice` | A player's Heads/Tails choice for a given round (bounded per round — see `contract/BOUNDS.md`) |
 | `DataKey::Survivor(player)` | `()` | Marker set when a player successfully joins; used to verify eligibility in `claim` |
+| `DataKey::Eliminated(player)` | `bool` | Marker set when a player is eliminated by `resolve_round`; used by `submit_choice` to return `PlayerEliminated` instead of `NotASurvivor` |
 | `DataKey::PrizeClaimed(winner)` | `i128` | Records the prize amount claimed by the winner; prevents double-claim |
 
 #### Instance storage (`env.storage().instance()`)
@@ -79,10 +80,11 @@ No custom Soroban storage keys are currently defined or used.
 | `start_round` | `Config`, `Round` | `Round` | `Round` |
 | `submit_choice` | `Round`, `Submission(n, player)` | `Submission(n, player)`, `Round` | `Submission(n, player)`, `Round` |
 | `timeout_round` | `Round` | `Round` | `Round` |
+| `resolve_round` | `Round`, `HeadsSubmitters(n)`, `TailsSubmitters(n)`, `Survivor(player)` | `Round`, remove `Survivor(player)`, write `Eliminated(player)`, update `S_COUNT` (instance) | `Round`, `Eliminated(player)` |
 | `get_config` | `Config` | — | — |
 | `get_round` | `Round` | — | — |
 | `get_choice` | `Submission(n, player)` | — | — |
-| `join` | `TOKEN`, `S_COUNT`, `PRIZE` (instance), `Survivor(player)` | `Survivor(player)`, `S_COUNT`, `PRIZE` (instance) | `Survivor(player)` |
+| `join` | `TOKEN`, `CAPACITY`, `S_COUNT`, `PRIZE` (instance), `Survivor(player)` | `Survivor(player)`, `S_COUNT`, `PRIZE` (instance) | `Survivor(player)` |
 | `set_token` | `ADMIN` (instance) | `TOKEN` (instance) | — |
 | `survivor_count` | `S_COUNT` (instance) | — | — |
 | `claim` | `G_FIN`, `S_COUNT`, `Survivor(winner)`, `PrizeClaimed(winner)`, `PRIZE`, `TOKEN` | `PrizeClaimed(winner)`, `PRIZE`, `G_FIN` (instance) | `PrizeClaimed(winner)` |
@@ -90,9 +92,9 @@ No custom Soroban storage keys are currently defined or used.
 | `propose_upgrade` ¹ | `ADMIN` (instance) | `P_HASH`, `P_AFTER` (instance) | — |
 | `execute_upgrade` ¹ | `ADMIN`, `P_AFTER`, `P_HASH` (instance) | removes `P_HASH`, `P_AFTER` (instance) | — |
 | `cancel_upgrade` ¹ | `ADMIN`, `P_HASH` (instance) | removes `P_HASH`, `P_AFTER` (instance) | — |
-| `join` | `Survivor(player)`, `S_COUNT` (instance) | `Survivor(player)`, `S_COUNT` (instance) | `Survivor(player)` |
 | `set_capacity` | `ADMIN` (instance) | `CAPACITY` (instance) | — |
 | `get_arena_state` | `S_COUNT`, `CAPACITY` (instance), `Round` | — | — |
+| `get_user_state` | `Survivor(player)`, `Winner(player)` | — | — |
 
 ¹ Exempt from the global pause check — see [Emergency Pause Policy](#emergency-pause-policy) below.
 

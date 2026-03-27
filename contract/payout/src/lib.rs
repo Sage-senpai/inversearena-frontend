@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-
+    Address, Env, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
+    panic_with_error, symbol_short, token,
 };
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
@@ -12,7 +13,9 @@ const TOPIC_DUST_COLLECTED: Symbol = symbol_short!("DUST");
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-
+    CurrencyToken(Symbol),
+    Payout(Symbol, u32, u32, Address),
+    PrizePayout(u32),
 }
 
 #[contracttype]

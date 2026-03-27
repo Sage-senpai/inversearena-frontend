@@ -6,7 +6,7 @@ use std::vec::Vec;
 use super::*;
 use proptest::prelude::*;
 use soroban_sdk::{
-    Address, BytesN, Env,
+    Address, Bytes, BytesN, Env,
     testutils::{Address as _, Ledger as _, LedgerInfo},
     token::StellarAssetClient,
 };
@@ -60,6 +60,12 @@ fn make_env() -> Env {
     env.mock_all_auths();
     set_ledger(&env, 0);
     env
+}
+
+fn seed_contract_prng(env: &Env, contract_id: &Address, seed: [u8; 32]) {
+    env.as_contract(contract_id, || {
+        env.prng().seed(Bytes::from_array(env, &seed));
+    });
 }
 
 fn create_client<'a>(env: &'a Env) -> ArenaContractClient<'a> {
@@ -1216,7 +1222,7 @@ fn resolve_round_advances_minority_survivors() {
 }
 
 #[test]
-fn resolve_round_tie_breaks_deterministically_from_ledger_sequence() {
+fn resolve_round_tie_break_uses_prng_seed_instead_of_ledger_sequence() {
     let (env, _admin, client, _token_id, players) = setup_game(5, 2);
 
     set_ledger_sequence(&env, 20);
@@ -1224,13 +1230,14 @@ fn resolve_round_tie_breaks_deterministically_from_ledger_sequence() {
     client.submit_choice(&players[0], &1, &Choice::Heads);
     client.submit_choice(&players[1], &1, &Choice::Tails);
 
+    seed_contract_prng(&env, &client.address, [1; 32]);
+
     let resolve_ledger = 26;
     set_ledger_sequence(&env, resolve_ledger);
     client.resolve_round();
 
-    let heads_survive = ((resolve_ledger ^ 1) & 1) == 0;
-    assert_eq!(client.get_user_state(&players[0]).is_active, heads_survive);
-    assert_eq!(client.get_user_state(&players[1]).is_active, !heads_survive);
+    assert!(client.get_user_state(&players[0]).is_active);
+    assert!(!client.get_user_state(&players[1]).is_active);
 }
 
 #[test]
@@ -1276,6 +1283,45 @@ fn resolve_round_allows_next_round_only_for_remaining_survivors() {
 
     let err = client.try_submit_choice(&players[2], &2, &Choice::Tails);
     assert_eq!(err, Err(Ok(ArenaError::PlayerEliminated)));
+}
+
+#[test]
+fn resolve_round_can_chain_across_multiple_rounds_until_one_survivor_remains() {
+    let (env, _admin, client, _token_id, players) = setup_game(5, 8);
+
+    set_ledger_sequence(&env, 60);
+    let round_one = client.start_round();
+    assert_eq!(round_one.round_number, 1);
+
+    for player in &players[0..5] {
+        client.submit_choice(player, &1, &Choice::Heads);
+    }
+    for player in &players[5..8] {
+        client.submit_choice(player, &1, &Choice::Tails);
+    }
+
+    set_ledger_sequence(&env, 66);
+    let resolved_one = client.resolve_round();
+    assert!(resolved_one.finished);
+    assert_eq!(client.get_arena_state().survivors_count, 3);
+
+    set_ledger_sequence(&env, 70);
+    let round_two = client.start_round();
+    assert_eq!(round_two.round_number, 2);
+
+    client.submit_choice(&players[5], &2, &Choice::Heads);
+    client.submit_choice(&players[6], &2, &Choice::Heads);
+    client.submit_choice(&players[7], &2, &Choice::Tails);
+
+    set_ledger_sequence(&env, 76);
+    let resolved_two = client.resolve_round();
+
+    assert_eq!(resolved_two.round_number, 2);
+    assert!(resolved_two.finished);
+    assert_eq!(client.get_arena_state().survivors_count, 1);
+    assert!(!client.get_user_state(&players[5]).is_active);
+    assert!(!client.get_user_state(&players[6]).is_active);
+    assert!(client.get_user_state(&players[7]).is_active);
 }
 
 // ── Pause mechanism tests ───────────────────────────────────────────────────

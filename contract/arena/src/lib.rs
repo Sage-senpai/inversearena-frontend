@@ -490,8 +490,7 @@ impl ArenaContract {
         let heads_count = heads_submitters.len();
         let tails_count = tails_submitters.len();
 
-        let surviving_choice =
-            choose_surviving_side(&env, round.round_number, heads_count, tails_count);
+        let surviving_choice = choose_surviving_side(&env, heads_count, tails_count);
         let eliminated_players = match surviving_choice {
             Some(Choice::Heads) => tails_submitters,
             Some(Choice::Tails) => heads_submitters,
@@ -749,18 +748,13 @@ fn get_submitters(env: &Env, key: &DataKey) -> Vec<Address> {
     storage(env).get(key).unwrap_or(Vec::new(env))
 }
 
-fn choose_surviving_side(
-    env: &Env,
-    round_number: u32,
-    heads_count: u32,
-    tails_count: u32,
-) -> Option<Choice> {
+fn choose_surviving_side(env: &Env, heads_count: u32, tails_count: u32) -> Option<Choice> {
     match (heads_count, tails_count) {
         (0, 0) => None,
         (0, _) => Some(Choice::Tails),
         (_, 0) => Some(Choice::Heads),
         _ if heads_count == tails_count => {
-            if ((env.ledger().sequence() ^ round_number) & 1) == 0 {
+            if (env.prng().r#gen::<u64>() & 1) == 0 {
                 Some(Choice::Heads)
             } else {
                 Some(Choice::Tails)

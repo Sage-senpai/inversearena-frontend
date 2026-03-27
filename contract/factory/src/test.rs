@@ -4,6 +4,7 @@ use arena::ArenaContractClient;
 use soroban_sdk::{
     Address, BytesN, Env,
     testutils::{Address as _, Ledger, LedgerInfo},
+    token::StellarAssetClient,
 };
 
 const TIMELOCK: u64 = 48 * 60 * 60; // 48 hours
@@ -316,6 +317,29 @@ fn test_create_pool_deploys_interactive_arena() {
 
     // Admin should have been transferred from factory to the caller.
     assert_eq!(arena.admin(), admin);
+}
+
+#[test]
+fn create_pool_arena_is_immediately_joinable() {
+    let (env, admin, client) = setup();
+    client.set_arena_wasm_hash(&dummy_hash(&env));
+
+    let token_admin = Address::generate(&env);
+    let currency = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let token = StellarAssetClient::new(&env, &currency);
+
+    let arena_addr = client.create_pool(&admin, &MIN_STAKE, &currency, &10u32, &8u32);
+
+    let env_s: &'static Env = unsafe { &*(&env as *const Env) };
+    let arena = ArenaContractClient::new(env_s, &arena_addr);
+    let player = Address::generate(&env);
+    token.mint(&player, &(MIN_STAKE * 2));
+
+    assert!(arena.try_join(&player, &MIN_STAKE).is_ok());
+    assert_eq!(arena.get_arena_state().survivors_count, 1);
+    assert_eq!(arena.get_arena_state().current_stake, MIN_STAKE);
 }
 
 /// Two consecutive `create_pool` calls produce two distinct arena addresses,
