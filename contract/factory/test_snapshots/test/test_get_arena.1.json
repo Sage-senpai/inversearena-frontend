@@ -488,6 +488,14 @@
                   "map": [
                     {
                       "key": {
+                        "symbol": "max_rounds"
+                      },
+                      "val": {
+                        "u32": 20
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "required_stake_amount"
                       },
                       "val": {

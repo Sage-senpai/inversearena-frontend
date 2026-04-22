@@ -2748,3 +2748,182 @@ fn resolve_round_minority_wins_parameterized() {
         }
     }
 }
+
+// ── Issue #500: initialize() guards ──────────────────────────────────────────
+
+#[test]
+fn initialize_happy_path_stores_admin() {
+    let env = make_env();
+    let client = create_client(&env);
+    let admin = Address::generate(&env);
+    client.initialize(&admin);
+    assert_eq!(client.admin(), admin);
+}
+
+#[test]
+fn initialize_duplicate_call_returns_already_initialized() {
+    let (_env, admin, client) = setup_with_admin();
+    let result = client.try_initialize(&admin);
+    // Duplicate init should return AlreadyInitialized via contract error path
+    assert!(result.is_err(), "second initialize must fail");
+}
+
+#[test]
+fn initialize_missing_auth_fails() {
+    let env = Env::default();
+    let contract_id = env.register(ArenaContract, ());
+    let admin = Address::generate(&env);
+    let impersonator = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &impersonator,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: soroban_sdk::vec![&env, admin.clone().into_val(&env)].into(),
+            sub_invokes: &[],
+        },
+    }]);
+    let client = ArenaContractClient::new(&env, &contract_id);
+    let result = client.try_initialize(&admin);
+    assert!(result.is_err(), "admin auth not provided — must fail");
+}
+
+#[test]
+fn post_init_admin_query_returns_admin() {
+    let (_env, admin, client) = setup_with_admin();
+    assert_eq!(client.admin(), admin);
+}
+
+// ── Issue #502: cancel_arena() ────────────────────────────────────────────────
+
+#[test]
+fn cancel_zero_players_sets_cancelled_flag() {
+    let (env, admin, client) = setup_with_admin();
+    let (_asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+    client.init(&5u32, &TEST_REQUIRED_STAKE);
+    client.cancel_arena();
+    assert!(client.is_cancelled());
+}
+
+#[test]
+fn cancel_pending_arena_refunds_joined_players() {
+    let (env, _admin, client, token_id, players) = setup_game(5, 3);
+    let token_client = soroban_sdk::token::TokenClient::new(&env, &token_id);
+    let balances_before: std::vec::Vec<i128> =
+        players.iter().map(|p| token_client.balance(&p)).collect();
+
+    client.cancel_arena();
+
+    assert!(client.is_cancelled());
+    for (i, player) in players.iter().enumerate() {
+        assert_eq!(
+            token_client.balance(&player),
+            balances_before[i] + TEST_REQUIRED_STAKE,
+            "player {i} should be refunded"
+        );
+    }
+}
+
+#[test]
+fn cancel_after_game_finished_returns_error() {
+    let (_env, _admin, client, _token_id, _winner) = setup_finished_game_with_winner(0);
+    let result = client.try_cancel_arena();
+    assert_eq!(result, Err(Ok(ArenaError::GameAlreadyFinished)));
+}
+
+#[test]
+fn double_cancel_returns_already_cancelled() {
+    let (_env, _admin, client, _token_id, _players) = setup_game(5, 2);
+    client.cancel_arena();
+    let result = client.try_cancel_arena();
+    assert_eq!(result, Err(Ok(ArenaError::AlreadyCancelled)));
+}
+
+// ── Issue #506: Emergency pause (arena) ──────────────────────────────────────
+
+#[test]
+fn pause_blocks_join() {
+    let (env, _admin, client, token_id, _players) = setup_game(5, 0);
+    client.pause();
+    let new_player = Address::generate(&env);
+    let asset = StellarAssetClient::new(&env, &token_id);
+    asset.mint(&new_player, &1_000_000i128);
+    let result = client.try_join(&new_player, &TEST_REQUIRED_STAKE);
+    assert_eq!(result, Err(Ok(ArenaError::Paused)));
+}
+
+#[test]
+fn pause_blocks_start_round() {
+    let (_env, _admin, client, _token_id, _players) = setup_game(5, 2);
+    client.pause();
+    let result = client.try_start_round();
+    assert_eq!(result, Err(Ok(ArenaError::Paused)));
+}
+
+#[test]
+fn pause_blocks_cancel_arena() {
+    let (_env, _admin, client, _token_id, _players) = setup_game(5, 2);
+    client.pause();
+    let result = client.try_cancel_arena();
+    assert_eq!(result, Err(Ok(ArenaError::Paused)));
+}
+
+#[test]
+fn unpause_restores_join() {
+    let (env, _admin, client, token_id, _players) = setup_game(5, 0);
+    client.pause();
+    client.unpause();
+    assert!(!client.is_paused());
+    let new_player = Address::generate(&env);
+    let asset = StellarAssetClient::new(&env, &token_id);
+    asset.mint(&new_player, &1_000_000i128);
+    let result = client.try_join(&new_player, &TEST_REQUIRED_STAKE);
+    assert!(result.is_ok(), "join should succeed after unpause");
+}
+
+#[test]
+fn read_functions_unaffected_by_arena_pause() {
+    let (_env, _admin, client, _token_id, _players) = setup_game(5, 2);
+    client.pause();
+    let _ = client.is_paused();
+    let _ = client.is_cancelled();
+    let _ = client.admin();
+}
+
+// ── Issue #513: max_rounds cap ───────────────────────────────────────────────
+
+#[test]
+fn set_max_rounds_rejects_zero() {
+    let (env, admin, client) = setup_with_admin();
+    let (_asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+    client.init(&5u32, &TEST_REQUIRED_STAKE);
+    assert_eq!(
+        client.try_set_max_rounds(&0u32),
+        Err(Ok(ArenaError::InvalidMaxRounds))
+    );
+}
+
+#[test]
+fn set_max_rounds_rejects_above_max() {
+    let (env, admin, client) = setup_with_admin();
+    let (_asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+    client.init(&5u32, &TEST_REQUIRED_STAKE);
+    assert_eq!(
+        client.try_set_max_rounds(&(bounds::MAX_MAX_ROUNDS + 1)),
+        Err(Ok(ArenaError::InvalidMaxRounds))
+    );
+}
+
+#[test]
+fn set_max_rounds_accepts_boundary_values() {
+    let (env, admin, client) = setup_with_admin();
+    let (_asset, token_id) = setup_token(&env, &admin);
+    client.set_token(&token_id);
+    client.init(&5u32, &TEST_REQUIRED_STAKE);
+    assert!(client.try_set_max_rounds(&bounds::MIN_MAX_ROUNDS).is_ok());
+    assert!(client.try_set_max_rounds(&bounds::MAX_MAX_ROUNDS).is_ok());
+    assert!(client.try_set_max_rounds(&bounds::DEFAULT_MAX_ROUNDS).is_ok());
+}

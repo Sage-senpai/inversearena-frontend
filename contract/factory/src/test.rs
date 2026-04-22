@@ -945,3 +945,90 @@ fn test_unauthorized_remove_supported_token_panics() {
     assert_auth_err(result2);
     let _ = (attacker, result); // suppress unused warnings
 }
+
+// ── Issue #500: initialize() auth guards (factory) ───────────────────────────
+
+#[test]
+fn initialize_with_wrong_signer_fails() {
+    let env = Env::default();
+    let contract_id = env.register(FactoryContract, ());
+    let admin = Address::generate(&env);
+    let impersonator = Address::generate(&env);
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &impersonator,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: soroban_sdk::vec![&env, admin.clone().into_val(&env)].into(),
+            sub_invokes: &[],
+        },
+    }]);
+    let client = FactoryContractClient::new(&env, &contract_id);
+    assert_auth_err(client.try_initialize(&admin));
+    let _ = impersonator;
+}
+
+#[test]
+fn initialize_duplicate_call_returns_already_initialized() {
+    let (_env, admin, client) = setup();
+    let result = client.try_initialize(&admin);
+    assert_eq!(result, Err(Ok(Error::AlreadyInitialized)));
+}
+
+// ── Issue #506: Emergency pause (factory) ────────────────────────────────────
+
+#[test]
+fn admin_can_pause_and_unpause_factory() {
+    let (_env, _admin, client) = setup();
+    assert!(!client.is_paused());
+    client.pause();
+    assert!(client.is_paused());
+    client.unpause();
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn pause_blocks_add_supported_token() {
+    let (env, _admin, client) = setup();
+    client.pause();
+    let token = Address::generate(&env);
+    let result = client.try_add_supported_token(&token);
+    assert_eq!(result, Err(Ok(Error::Paused)));
+}
+
+#[test]
+fn pause_blocks_remove_supported_token() {
+    let (env, _admin, client) = setup();
+    let token = supported_currency(&env, &client);
+    client.pause();
+    let result = client.try_remove_supported_token(&token);
+    assert_eq!(result, Err(Ok(Error::Paused)));
+}
+
+#[test]
+fn pause_blocks_set_min_stake() {
+    let (_env, _admin, client) = setup();
+    client.pause();
+    let result = client.try_set_min_stake(&20_000_000i128);
+    assert_eq!(result, Err(Ok(Error::Paused)));
+}
+
+#[test]
+fn unpause_restores_add_supported_token() {
+    let (env, _admin, client) = setup();
+    client.pause();
+    client.unpause();
+    let token = Address::generate(&env);
+    assert!(client.try_add_supported_token(&token).is_ok());
+    assert!(client.is_token_supported(&token));
+}
+
+#[test]
+fn read_functions_unaffected_by_factory_pause() {
+    let (env, admin, client) = setup();
+    client.pause();
+    assert_eq!(client.admin(), admin);
+    assert!(!client.is_whitelisted(&Address::generate(&env)));
+    assert_eq!(client.get_min_stake(), MIN_STAKE);
+    assert!(client.is_paused());
+}

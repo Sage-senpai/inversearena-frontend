@@ -45,3 +45,14 @@ pub const MIN_REQUIRED_STAKE: i128 = 1;
 /// Minimum `required_stake_amount` — 10_000_000 stroops = 10 XLM.
 #[cfg(not(test))]
 pub const MIN_REQUIRED_STAKE: i128 = 10_000_000;
+
+/// Default maximum number of rounds before a forced-draw resolution is triggered.
+pub const DEFAULT_MAX_ROUNDS: u32 = 20;
+
+/// Minimum configurable value for `max_rounds`. A cap of 1 means the very first
+/// round always ends in a forced draw (useful for testing).
+pub const MIN_MAX_ROUNDS: u32 = 1;
+
+/// Maximum configurable value for `max_rounds`. Keeps game duration bounded to
+/// prevent indefinite fund locking.
+pub const MAX_MAX_ROUNDS: u32 = 100;

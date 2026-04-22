@@ -4,30 +4,12 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
+    IntoVal,
     testutils::Address as _, Address, Env,
-    token::StellarAssetClient,
+    token::{self, StellarAssetClient},
 };
 
-fn setup() -> (Env, Address, Address) {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let staker = Address::generate(&env);
-
-    let token_admin = Address::generate(&env);
-    let token_id = env
-        .register_stellar_asset_contract_v2(token_admin.clone())
-        .address();
-    let token_admin_client = StellarAssetClient::new(&env, &token_id);
-    token_admin_client.mint(&staker, &10_000i128);
-
-    let contract_id = env.register_contract(None, StakingContract);
-    let client = StakingContractClient::new(&env, &contract_id);
-    client.initialize(&admin, &token_id);
-
-    (env, contract_id, staker)
-}
+// ── helpers ───────────────────────────────────────────────────────────────────
 
 fn setup() -> (
     Env,
@@ -60,6 +42,93 @@ fn setup() -> (
     )
 }
 
+// ── Issue #500: initialize() guard tests ─────────────────────────────────────
+
+#[test]
+fn initialize_happy_path_stores_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let admin = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    let contract_id = env.register(StakingContract, ());
+    let client = StakingContractClient::new(&env, &contract_id);
+
+    client.initialize(&admin, &token_addr);
+    assert_eq!(client.admin(), admin);
+}
+
+#[test]
+#[should_panic(expected = "already initialized")]
+fn initialize_duplicate_call_panics() {
+    let (_env, admin, _staker, client, token_client) = setup();
+    // Second call must panic.
+    client.initialize(&admin, &token_client.address);
+}
+
+#[test]
+fn initialize_without_auth_panics() {
+    // staking's initialize requires admin.require_auth().
+    // Without mock_all_auths the call should fail auth.
+    let env = Env::default();
+    // No mock_all_auths — auth failures turn into contract aborts.
+
+    let admin = Address::generate(&env);
+    let token_addr = Address::generate(&env);
+    let contract_id = env.register(StakingContract, ());
+    let client = StakingContractClient::new(&env, &contract_id);
+
+    let result = client.try_initialize(&admin, &token_addr);
+    // Soroban v22 reports auth failures as contract-level errors (not host aborts).
+    assert!(result.is_err(), "initialize without auth must fail, got: {:?}", result);
+}
+
+#[test]
+fn initialize_wrong_caller_cannot_init() {
+    // A different address from admin tries to call initialize with admin as arg.
+    // Soroban auth checks that the admin address itself signed; providing the
+    // admin address as argument but signing as someone else must fail.
+    let env = Env::default();
+    // mock_auths with an impersonator — admin.require_auth() will not be satisfied
+    let admin = Address::generate(&env);
+    let impersonator = Address::generate(&env);
+    let token_id = Address::generate(&env);
+    let contract_id = env.register(StakingContract, ());
+    let client = StakingContractClient::new(&env, &contract_id);
+
+    // Only provide auth for impersonator, NOT for admin.
+    // admin.require_auth() inside initialize() will fail.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &impersonator,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: soroban_sdk::vec![
+                &env,
+                admin.clone().into_val(&env),
+                token_id.clone().into_val(&env)
+            ].into(),
+            sub_invokes: &[],
+        },
+    }]);
+
+    // admin.require_auth() requires admin's own signature, not impersonator's
+    let result = client.try_initialize(&admin, &token_id);
+    assert!(
+        result.is_err(),
+        "initialize with wrong signer must fail"
+    );
+    let _ = impersonator; // suppress unused warning
+}
+
+#[test]
+fn admin_query_returns_correct_address_after_init() {
+    let (_env, admin, _staker, client, _token) = setup();
+    assert_eq!(client.admin(), admin);
+}
+
+// ── token/admin query tests ───────────────────────────────────────────────────
+
 #[test]
 fn initialize_sets_token_and_zero_totals() {
     let (_env, _admin, _staker, client, token_client) = setup();
@@ -68,6 +137,8 @@ fn initialize_sets_token_and_zero_totals() {
     assert_eq!(client.total_staked(), 0);
     assert_eq!(client.total_shares(), 0);
 }
+
+// ── stake tests ───────────────────────────────────────────────────────────────
 
 #[test]
 fn stake_transfers_tokens_and_records_position() {
@@ -143,15 +214,11 @@ fn stake_rejects_non_positive_amounts() {
 
 #[test]
 fn stake_state_is_updated_before_transfer() {
-    // Verifies CEI ordering: after stake(), totals and position reflect the deposit
-    // regardless of when the token transfer settles — ensuring a re-entrant read
-    // during transfer would see the already-committed state, not stale balances.
     let (_env, _admin, staker, client, _token_client) = setup();
 
     let amount = 500_000_000i128;
     let minted = client.stake(&staker, &amount);
 
-    // State must be committed
     assert_eq!(client.total_staked(), amount);
     assert_eq!(client.total_shares(), minted);
     assert_eq!(
@@ -162,14 +229,14 @@ fn stake_state_is_updated_before_transfer() {
         }
     );
 
-    // A second stake uses already-updated totals for share calculation
     let amount2 = 100_000_000i128;
     let minted2 = client.stake(&staker, &amount2);
-    // shares = amount2 * total_shares / total_staked = 100M * 500M / 500M = 100M
     assert_eq!(minted2, amount2);
     assert_eq!(client.total_staked(), amount + amount2);
     assert_eq!(client.total_shares(), minted + minted2);
 }
+
+// ── unstake tests ─────────────────────────────────────────────────────────────
 
 #[test]
 fn unstake_full_returns_all_tokens() {
@@ -227,7 +294,7 @@ fn unstake_rejects_zero_shares() {
     );
 }
 
-// ── Issue #388: stake/unstake events use only fixed topic; variable data in payload ──
+// ── Issue #388: stake/unstake events ─────────────────────────────────────────
 
 #[test]
 fn stake_emits_one_event() {
@@ -239,8 +306,6 @@ fn stake_emits_one_event() {
     client.stake(&staker, &100_000_000i128);
     let after = env.events().all().len();
 
-    // Exactly one staking event must be emitted (token SAC transfers do not
-    // add to the contract event log in the test environment).
     assert!(
         after > before,
         "stake() must emit at least one event"
@@ -255,8 +320,6 @@ fn unstake_emits_one_event() {
 
     let shares = client.stake(&staker, &100_000_000i128);
 
-    // Flush the previous invocation's events with a read-only call (emits 0 events)
-    // so that `before` reflects a clean baseline for the unstake call.
     let _ = client.total_staked();
     let before = env.events().all().len();
     client.unstake(&staker, &shares);
@@ -274,8 +337,6 @@ fn stake_and_unstake_each_emit_exactly_one_new_event() {
 
     let (env, _admin, staker, client, _token_client) = setup();
 
-    // env.events().all() returns events for the most-recent invocation only.
-    // Capture counts directly after each call rather than computing deltas.
     let shares = client.stake(&staker, &100_000_000i128);
     let stake_events = env.events().all().len();
 
@@ -286,43 +347,44 @@ fn stake_and_unstake_each_emit_exactly_one_new_event() {
     assert!(unstake_events >= 1, "unstake() must emit at least one event");
 }
 
+// ── Issue #506: emergency pause tests ────────────────────────────────────────
+
 #[test]
 fn stake_fails_when_paused() {
-    let (env, contract_id, staker) = setup();
-    let client = StakingContractClient::new(&env, &contract_id);
+    let (_env, _admin, staker, client, _token_client) = setup();
 
     client.pause();
     assert!(client.is_paused());
 
-    let result = client.try_stake(&staker, &500i128);
-    assert_eq!(result, Err(Ok(StakingError::Paused)));
+    assert_eq!(
+        client.try_stake(&staker, &500i128),
+        Err(Ok(StakingError::Paused))
+    );
 }
 
 #[test]
 fn unstake_fails_when_paused() {
-    let (env, contract_id, staker) = setup();
-    let client = StakingContractClient::new(&env, &contract_id);
+    let (_env, _admin, staker, client, _token_client) = setup();
 
-    // Stake successfully while unpaused, then pause.
     client.stake(&staker, &1_000i128);
     assert_eq!(client.staked_balance(&staker), 1_000i128);
 
     client.pause();
     assert!(client.is_paused());
 
-    let result = client.try_unstake(&staker, &500i128);
-    assert_eq!(result, Err(Ok(StakingError::Paused)));
+    assert_eq!(
+        client.try_unstake(&staker, &500i128),
+        Err(Ok(StakingError::Paused))
+    );
 
     // Balance unchanged.
     assert_eq!(client.staked_balance(&staker), 1_000i128);
 }
 
 #[test]
-fn unpause_restores_functionality() {
-    let (env, contract_id, staker) = setup();
-    let client = StakingContractClient::new(&env, &contract_id);
+fn unpause_restores_stake_functionality() {
+    let (_env, _admin, staker, client, _token_client) = setup();
 
-    // Pause and verify stake is blocked.
     client.pause();
     assert!(client.is_paused());
     assert_eq!(
@@ -330,7 +392,6 @@ fn unpause_restores_functionality() {
         Err(Ok(StakingError::Paused))
     );
 
-    // Unpause and verify stake succeeds.
     client.unpause();
     assert!(!client.is_paused());
 
@@ -338,8 +399,61 @@ fn unpause_restores_functionality() {
     assert_eq!(shares, 500i128);
     assert_eq!(client.staked_balance(&staker), 500i128);
 
-    // Unstake also works after unpause.
     let returned = client.unstake(&staker, &500i128);
     assert_eq!(returned, 500i128);
     assert_eq!(client.staked_balance(&staker), 0i128);
 }
+
+#[test]
+fn is_paused_returns_false_before_pausing() {
+    let (_env, _admin, _staker, client, _token_client) = setup();
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn non_admin_cannot_pause() {
+    // Set up a fresh env: mock_auths only for initialize, then try pause with no auth.
+    // This avoids the cross-env object-reference pitfall.
+    let env = Env::default();
+    let contract_id = env.register(StakingContract, ());
+    let admin = Address::generate(&env);
+    let token_id = Address::generate(&env);
+
+    // Authorize ONLY the initialize call for admin.
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &admin,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: soroban_sdk::vec![
+                &env,
+                admin.clone().into_val(&env),
+                token_id.clone().into_val(&env)
+            ].into(),
+            sub_invokes: &[],
+        },
+    }]);
+    let client = StakingContractClient::new(&env, &contract_id);
+    client.initialize(&admin, &token_id);
+
+    // No mock auth remains — admin.require_auth() inside pause() will fail.
+    let result = client.try_pause();
+    assert!(result.is_err(), "non-admin must not be able to pause");
+}
+
+#[test]
+fn read_functions_unaffected_by_pause() {
+    let (_env, _admin, staker, client, _token_client) = setup();
+
+    client.stake(&staker, &1_000i128);
+    client.pause();
+
+    // Read-only calls must succeed regardless of pause state.
+    assert!(client.is_paused());
+    assert_eq!(client.total_staked(), 1_000i128);
+    assert_eq!(client.total_shares(), 1_000i128);
+    assert_eq!(client.staked_balance(&staker), 1_000i128);
+    assert!(client.get_position(&staker).shares > 0);
+}
+
+

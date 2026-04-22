@@ -292,3 +292,88 @@ fn payout_record_survives_ttl_threshold() {
         "payout record must survive past TTL threshold due to extend_ttl"
     );
 }
+
+// ── Issue #500: initialize() auth guards (payout) ────────────────────────────
+
+#[test]
+fn initialize_with_wrong_signer_fails() {
+    // Without mock_all_auths, initialize() requires the admin to self-sign.
+    // Providing a different signer should cause an auth failure (contract error or abort).
+    let env = Env::default();
+    let contract_id = env.register(PayoutContract, ());
+    let admin = Address::generate(&env);
+    let impersonator = Address::generate(&env);
+    use soroban_sdk::IntoVal;
+    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
+        address: &impersonator,
+        invoke: &soroban_sdk::testutils::MockAuthInvoke {
+            contract: &contract_id,
+            fn_name: "initialize",
+            args: soroban_sdk::vec![&env, admin.clone().into_val(&env)].into(),
+            sub_invokes: &[],
+        },
+    }]);
+    let client = PayoutContractClient::new(&env, &contract_id);
+    // try_initialize returns an error when admin auth is not satisfied
+    let result = client.try_initialize(&admin);
+    assert!(result.is_err(), "initialize with wrong signer must fail");
+    let _ = impersonator;
+}
+
+// ── Issue #506: Emergency pause (payout) ─────────────────────────────────────
+
+#[test]
+fn admin_can_pause_and_unpause_payout() {
+    let (_env, _admin, client) = setup();
+    assert!(!client.is_paused());
+    client.pause();
+    assert!(client.is_paused());
+    client.unpause();
+    assert!(!client.is_paused());
+}
+
+#[test]
+fn pause_blocks_distribute_winnings() {
+    let (env, admin, client) = setup();
+    client.pause();
+    let winner = Address::generate(&env);
+    let ctx = symbol_short!("CTX");
+    let currency = symbol_short!("XLM");
+    let result = client.try_distribute_winnings(
+        &admin, &ctx, &1u32, &1u32, &winner, &100i128, &currency,
+    );
+    assert_eq!(result, Err(Ok(PayoutError::Paused)));
+}
+
+#[test]
+fn pause_blocks_distribute_prize() {
+    let (env, _admin, client, token_id, _treasury) = setup_with_token();
+    client.pause();
+    let winners = Vec::from_array(&env, [Address::generate(&env)]);
+    let result = client.try_distribute_prize(&1u32, &100i128, &winners, &token_id);
+    assert_eq!(result, Err(Ok(PayoutError::Paused)));
+}
+
+#[test]
+fn unpause_restores_distribute_winnings() {
+    let (env, admin, client) = setup();
+    client.pause();
+    client.unpause();
+    assert!(!client.is_paused());
+    let winner = Address::generate(&env);
+    let ctx = symbol_short!("CTX");
+    let currency = symbol_short!("XLM");
+    // distribute_winnings requires no actual token transfer, it just records
+    let result = client.try_distribute_winnings(
+        &admin, &ctx, &1u32, &1u32, &winner, &100i128, &currency,
+    );
+    assert!(result.is_ok(), "should succeed after unpause");
+}
+
+#[test]
+fn read_functions_unaffected_by_payout_pause() {
+    let (_env, admin, client) = setup();
+    client.pause();
+    assert_eq!(client.admin(), admin);
+    assert!(client.is_paused());
+}

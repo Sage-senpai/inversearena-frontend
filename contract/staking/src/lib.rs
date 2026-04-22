@@ -10,11 +10,15 @@ use soroban_sdk::{
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TOKEN_KEY: Symbol = symbol_short!("TOKEN");
+pub const TOTAL_STAKED_KEY: Symbol = symbol_short!("TSTAKE");
+const TOTAL_SHARES_KEY: Symbol = symbol_short!("TSHARES");
 
 // ── Event topics ──────────────────────────────────────────────────────────────
 
 const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
 const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
+const TOPIC_STAKE: Symbol = symbol_short!("STAKED");
+const TOPIC_UNSTAKE: Symbol = symbol_short!("UNSTAKED");
 
 // ── Error codes ───────────────────────────────────────────────────────────────
 
@@ -26,7 +30,8 @@ pub enum StakingError {
     AlreadyInitialized = 2,
     Paused = 3,
     InvalidAmount = 4,
-    InsufficientStake = 5,
+    InsufficientShares = 5,
+    ZeroShares = 6,
 }
 
 // ── Storage key schema ────────────────────────────────────────────────────────
@@ -34,7 +39,20 @@ pub enum StakingError {
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
-    Staked(Address),
+    Position(Address),
+}
+
+// ── Types ─────────────────────────────────────────────────────────────────────
+
+/// Per-staker position record.
+///
+/// * `amount`  — total tokens currently deposited by this staker.
+/// * `shares`  — shares currently held by this staker.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StakePosition {
+    pub amount: i128,
+    pub shares: i128,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -53,20 +71,13 @@ impl StakingContract {
 
     /// Initialise the staking contract. Must be called exactly once after deployment.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment.
-    /// * `admin` - Address to designate as the contract administrator.
-    /// * `token` - Address of the Soroban token contract used for stake/unstake.
-    ///
-    /// # Errors
-    /// Panics with `"already initialized"` if called more than once.
-    ///
     /// # Authorization
-    /// None — permissionless; must be called immediately after deploy.
+    /// Requires auth from the `admin` address to prevent front-running.
     pub fn initialize(env: Env, admin: Address, token: Address) {
         if env.storage().instance().has(&ADMIN_KEY) {
             panic!("already initialized");
         }
+        admin.require_auth();
         env.storage().instance().set(&ADMIN_KEY, &admin);
         env.storage().instance().set(&TOKEN_KEY, &token);
     }
@@ -76,6 +87,14 @@ impl StakingContract {
         env.storage()
             .instance()
             .get(&ADMIN_KEY)
+            .expect("not initialized")
+    }
+
+    /// Return the staking token address.
+    pub fn token(env: Env) -> Address {
+        env.storage()
+            .instance()
+            .get(&TOKEN_KEY)
             .expect("not initialized")
     }
 
@@ -111,15 +130,43 @@ impl StakingContract {
             .unwrap_or(false)
     }
 
+    // ── Query functions ───────────────────────────────────────────────────────
+
+    /// Total tokens currently held in the staking pool.
+    pub fn total_staked(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&TOTAL_STAKED_KEY)
+            .unwrap_or(0i128)
+    }
+
+    /// Total shares outstanding across all stakers.
+    pub fn total_shares(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&TOTAL_SHARES_KEY)
+            .unwrap_or(0i128)
+    }
+
+    /// Return the `StakePosition` for `staker`.
+    pub fn get_position(env: Env, staker: Address) -> StakePosition {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Position(staker))
+            .unwrap_or(StakePosition { amount: 0, shares: 0 })
+    }
+
+    /// Return the token amount currently staked by `staker`.
+    pub fn staked_balance(env: Env, staker: Address) -> i128 {
+        Self::get_position(env, staker).amount
+    }
+
     // ── Staking ───────────────────────────────────────────────────────────────
 
-    /// Deposit `amount` tokens and record the staked balance for `staker`.
-    /// Returns the number of shares minted (1:1 with deposited amount).
+    /// Deposit `amount` tokens and return the number of shares minted.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment.
-    /// * `staker` - Address depositing tokens.
-    /// * `amount` - Number of tokens to stake. Must be > 0.
+    /// Shares are minted proportionally: when the pool is empty, shares = amount;
+    /// otherwise, shares = amount × total_shares / total_staked.
     ///
     /// # Errors
     /// * [`StakingError::Paused`] — Contract is paused.
@@ -137,34 +184,69 @@ impl StakingContract {
         }
 
         let token_contract = get_token_contract(&env)?;
-        let token_client = token::Client::new(&env, &token_contract);
-        token_client.transfer(&staker, &env.current_contract_address(), &amount);
 
-        let current: i128 = env
+        let total_staked: i128 = env
+            .storage()
+            .instance()
+            .get(&TOTAL_STAKED_KEY)
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&TOTAL_SHARES_KEY)
+            .unwrap_or(0);
+
+        let shares_minted = if total_staked == 0 || total_shares == 0 {
+            amount
+        } else {
+            amount
+                .checked_mul(total_shares)
+                .and_then(|v| v.checked_div(total_staked))
+                .unwrap_or(amount)
+        };
+
+        // CEI: update state before token transfer.
+        env.storage()
+            .instance()
+            .set(&TOTAL_STAKED_KEY, &(total_staked + amount));
+        env.storage()
+            .instance()
+            .set(&TOTAL_SHARES_KEY, &(total_shares + shares_minted));
+
+        let mut position: StakePosition = env
             .storage()
             .persistent()
-            .get(&DataKey::Staked(staker.clone()))
-            .unwrap_or(0);
+            .get(&DataKey::Position(staker.clone()))
+            .unwrap_or(StakePosition { amount: 0, shares: 0 });
+        position.amount += amount;
+        position.shares += shares_minted;
         env.storage()
             .persistent()
-            .set(&DataKey::Staked(staker), &(current + amount));
+            .set(&DataKey::Position(staker.clone()), &position);
 
-        Ok(amount)
+        // Interaction: transfer tokens into the contract.
+        token::Client::new(&env, &token_contract).transfer(
+            &staker,
+            &env.current_contract_address(),
+            &amount,
+        );
+
+        env.events()
+            .publish((TOPIC_STAKE,), (staker, amount, shares_minted));
+
+        Ok(shares_minted)
     }
 
-    /// Withdraw `shares` tokens back to `staker`.
-    /// Returns the number of tokens returned (1:1 with shares).
+    /// Redeem `shares` shares and return the corresponding token amount.
     ///
-    /// # Arguments
-    /// * `env` - The Soroban environment.
-    /// * `staker` - Address withdrawing their stake.
-    /// * `shares` - Number of shares to redeem. Must be > 0 and ≤ current staked balance.
+    /// Tokens returned = shares × total_staked / total_shares.
     ///
     /// # Errors
     /// * [`StakingError::Paused`] — Contract is paused.
     /// * [`StakingError::NotInitialized`] — Contract has not been initialized.
-    /// * [`StakingError::InvalidAmount`] — `shares` is zero or negative.
-    /// * [`StakingError::InsufficientStake`] — `shares` exceeds the staker's balance.
+    /// * [`StakingError::ZeroShares`] — `shares` is zero.
+    /// * [`StakingError::InvalidAmount`] — `shares` is negative.
+    /// * [`StakingError::InsufficientShares`] — `shares` exceeds staker's balance.
     ///
     /// # Authorization
     /// Requires `staker.require_auth()`.
@@ -172,36 +254,64 @@ impl StakingContract {
         require_not_paused(&env)?;
         staker.require_auth();
 
-        if shares <= 0 {
+        if shares == 0 {
+            return Err(StakingError::ZeroShares);
+        }
+        if shares < 0 {
             return Err(StakingError::InvalidAmount);
         }
 
-        let current: i128 = env
+        let mut position: StakePosition = env
             .storage()
             .persistent()
-            .get(&DataKey::Staked(staker.clone()))
-            .unwrap_or(0);
-        if current < shares {
-            return Err(StakingError::InsufficientStake);
+            .get(&DataKey::Position(staker.clone()))
+            .unwrap_or(StakePosition { amount: 0, shares: 0 });
+        if position.shares < shares {
+            return Err(StakingError::InsufficientShares);
         }
 
+        let total_staked: i128 = env
+            .storage()
+            .instance()
+            .get(&TOTAL_STAKED_KEY)
+            .unwrap_or(0);
+        let total_shares: i128 = env
+            .storage()
+            .instance()
+            .get(&TOTAL_SHARES_KEY)
+            .unwrap_or(0);
+
+        let tokens_returned = shares
+            .checked_mul(total_staked)
+            .and_then(|v| v.checked_div(total_shares))
+            .unwrap_or(shares);
+
         let token_contract = get_token_contract(&env)?;
-        let token_client = token::Client::new(&env, &token_contract);
-        token_client.transfer(&env.current_contract_address(), &staker, &shares);
 
+        // CEI: update state before token transfer.
+        position.shares -= shares;
+        position.amount = position.amount.saturating_sub(tokens_returned);
         env.storage()
             .persistent()
-            .set(&DataKey::Staked(staker), &(current - shares));
-
-        Ok(shares)
-    }
-
-    /// Return the staked token balance for `staker`.
-    pub fn staked_balance(env: Env, staker: Address) -> i128 {
+            .set(&DataKey::Position(staker.clone()), &position);
         env.storage()
-            .persistent()
-            .get(&DataKey::Staked(staker))
-            .unwrap_or(0)
+            .instance()
+            .set(&TOTAL_STAKED_KEY, &(total_staked - tokens_returned));
+        env.storage()
+            .instance()
+            .set(&TOTAL_SHARES_KEY, &(total_shares - shares));
+
+        // Interaction: transfer tokens back to staker.
+        token::Client::new(&env, &token_contract).transfer(
+            &env.current_contract_address(),
+            &staker,
+            &tokens_returned,
+        );
+
+        env.events()
+            .publish((TOPIC_UNSTAKE,), (staker, tokens_returned, shares));
+
+        Ok(tokens_returned)
     }
 }
 

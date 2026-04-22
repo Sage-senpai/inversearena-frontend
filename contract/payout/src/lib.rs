@@ -7,8 +7,11 @@ use soroban_sdk::{
 
 const ADMIN_KEY: Symbol = symbol_short!("ADMIN");
 const TREASURY_KEY: Symbol = symbol_short!("TREAS");
+const PAUSED_KEY: Symbol = symbol_short!("PAUSED");
 const TOPIC_PAYOUT_EXECUTED: Symbol = symbol_short!("PAYOUT");
 const TOPIC_DUST_COLLECTED: Symbol = symbol_short!("DUST");
+const TOPIC_PAUSED: Symbol = symbol_short!("PAUSED");
+const TOPIC_UNPAUSED: Symbol = symbol_short!("UNPAUSED");
 
 // ── TTL constants ─────────────────────────────────────────────────────────────
 const PAYOUT_TTL_THRESHOLD: u32 = 100_000;
@@ -42,6 +45,8 @@ pub enum PayoutError {
     AlreadyPaid = 3,
     NoWinners = 4,
     TreasuryNotSet = 5,
+    /// Contract is paused; write operations are disabled.
+    Paused = 6,
 }
 
 #[contract]
@@ -99,6 +104,9 @@ impl PayoutContract {
     /// Admin-only. Used so `distribute_winnings` can transfer tokens on-chain.
     pub fn set_currency_token(env: Env, symbol: Symbol, token_address: Address) {
         let admin = Self::admin(env.clone());
+        if env.storage().instance().get::<_, bool>(&PAUSED_KEY).unwrap_or(false) {
+            panic_with_error!(&env, PayoutError::Paused);
+        }
         admin.require_auth();
         env.storage()
             .instance()
@@ -136,6 +144,8 @@ impl PayoutContract {
 
         // Enforce admin authorization before using caller identity checks.
         admin.require_auth();
+
+        require_not_paused(&env)?;
 
         if caller != admin {
             panic_with_error!(&env, PayoutError::UnauthorizedCaller);
@@ -226,6 +236,8 @@ impl PayoutContract {
         let admin = Self::admin(env.clone());
         admin.require_auth();
 
+        require_not_paused(&env)?;
+
         // Idempotency guard — prevent double-payment on retry
         let prize_key = DataKey::PrizePayout(game_id);
         if env.storage().instance().has(&prize_key) {
@@ -268,6 +280,45 @@ impl PayoutContract {
     pub fn is_prize_distributed(env: Env, game_id: u32) -> bool {
         env.storage().instance().has(&DataKey::PrizePayout(game_id))
     }
+
+    // ── Emergency pause ──────────────────────────────────────────────────────
+
+    /// Pause the contract, disabling all write operations. Admin-only.
+    pub fn pause(env: Env) {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+        env.storage().instance().set(&PAUSED_KEY, &true);
+        env.events().publish((TOPIC_PAUSED,), ());
+    }
+
+    /// Unpause the contract, re-enabling write operations. Admin-only.
+    pub fn unpause(env: Env) {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+        env.storage().instance().remove(&PAUSED_KEY);
+        env.events().publish((TOPIC_UNPAUSED,), ());
+    }
+
+    /// Return whether the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&PAUSED_KEY)
+            .unwrap_or(false)
+    }
+}
+
+/// Return `Err(PayoutError::Paused)` if the contract is currently paused.
+fn require_not_paused(env: &Env) -> Result<(), PayoutError> {
+    if env
+        .storage()
+        .instance()
+        .get(&PAUSED_KEY)
+        .unwrap_or(false)
+    {
+        return Err(PayoutError::Paused);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
