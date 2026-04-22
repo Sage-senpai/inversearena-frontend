@@ -1,8 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    Address, BytesN, Env, IntoVal, Symbol, contract, contracterror, contractimpl, contracttype,
-    symbol_short, xdr::ToXdr,
+    Address, BytesN, Env, IntoVal, String, Symbol, contract, contracterror, contractimpl,
+    contracttype, symbol_short, xdr::ToXdr,
 };
 
 #[cfg(test)]
@@ -472,6 +472,40 @@ impl FactoryContract {
 
         Ok(arena_address)
     }
+
+    /// Set human-readable metadata on a deployed arena contract.
+    ///
+    /// Forwards to the arena's `set_metadata` entrypoint.  The caller must be
+    /// the arena's admin (typically the pool creator who was set as admin during
+    /// `create_pool`).
+    ///
+    /// # Arguments
+    /// * `arena_address` — address of the deployed arena contract.
+    /// * `arena_id`      — application-level identifier stored inside the metadata.
+    /// * `name`          — display name, max 64 bytes.
+    /// * `description`   — optional description, max 256 bytes.
+    /// * `host`          — host address to record in the metadata.
+    pub fn set_arena_metadata(
+        env: Env,
+        arena_address: Address,
+        arena_id: u64,
+        name: String,
+        description: Option<String>,
+        host: Address,
+    ) {
+        env.invoke_contract::<()>(
+            &arena_address,
+            &soroban_sdk::Symbol::new(&env, "set_metadata"),
+            soroban_sdk::vec![
+                &env,
+                arena_id.into_val(&env),
+                name.into_val(&env),
+                description.into_val(&env),
+                host.into_val(&env),
+            ],
+        );
+    }
+
     /// Add a token to the supported currency list. Admin-only.
     pub fn add_supported_token(env: Env, token: Address) -> Result<(), Error> {
         let admin = require_admin(&env)?;

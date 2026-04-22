@@ -4,7 +4,7 @@ mod bounds;
 mod invariants;
 
 use soroban_sdk::{
-    Address, BytesN, Env, Map, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
+    Address, BytesN, Env, String, Symbol, Vec, contract, contracterror, contractimpl, contracttype,
     symbol_short, token,
 };
 
@@ -88,6 +88,9 @@ pub enum ArenaError {
     WinnerNotSet = 31,
     AlreadyCancelled = 32,
     InvalidMaxRounds = 33,
+    NameTooLong = 34,
+    NameEmpty = 35,
+    DescriptionTooLong = 36,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -176,6 +179,22 @@ pub struct FullStateView {
     pub has_won: bool,
 }
 
+/// Human-readable metadata attached to an arena instance.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct ArenaMetadata {
+    /// Application-level arena identifier (assigned by the factory or the host).
+    pub arena_id: u64,
+    /// Display name — max 64 bytes UTF-8.
+    pub name: String,
+    /// Optional description — max 256 bytes UTF-8.
+    pub description: Option<String>,
+    /// Address that created / hosts the arena.
+    pub host: Address,
+    /// Ledger timestamp at the moment metadata was stored.
+    pub created_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone)]
 enum DataKey {
@@ -191,6 +210,7 @@ enum DataKey {
     AllPlayers,
     Refunded(Address),
     State,
+    Metadata(u64),
 }
 
 
@@ -1095,16 +1115,55 @@ impl ArenaContract {
         })
     }
 
-    pub fn get_players(env: Env, arena_id: u64) -> Vec<Address> {
-        get_players(&env, arena_id)
+    /// Store human-readable metadata for this arena instance.
+    ///
+    /// # Errors
+    /// * `NameEmpty`           — `name` has zero bytes.
+    /// * `NameTooLong`         — `name` exceeds 64 bytes.
+    /// * `DescriptionTooLong`  — `description` exceeds 256 bytes.
+    ///
+    /// # Authorization
+    /// Requires admin signature.
+    pub fn set_metadata(
+        env: Env,
+        arena_id: u64,
+        name: String,
+        description: Option<String>,
+        host: Address,
+    ) -> Result<(), ArenaError> {
+        let admin = Self::admin(env.clone());
+        admin.require_auth();
+
+        if name.len() == 0 {
+            panic_with_error!(&env, ArenaError::NameEmpty);
+        }
+        if name.len() > 64 {
+            panic_with_error!(&env, ArenaError::NameTooLong);
+        }
+        if let Some(ref desc) = description {
+            if desc.len() > 256 {
+                panic_with_error!(&env, ArenaError::DescriptionTooLong);
+            }
+        }
+
+        let metadata = ArenaMetadata {
+            arena_id,
+            name,
+            description,
+            host,
+            created_at: env.ledger().timestamp(),
+        };
+
+        storage(&env).set(&DataKey::Metadata(arena_id), &metadata);
+        bump(&env, &DataKey::Metadata(arena_id));
+        Ok(())
     }
 
-    pub fn get_survivors(env: Env, arena_id: u64) -> Vec<Address> {
-        get_survivors(&env, arena_id)
-    }
-
-    pub fn get_eliminated(env: Env, arena_id: u64) -> Vec<Address> {
-        get_eliminated(&env, arena_id)
+    /// Return the stored metadata for the given `arena_id`, or `None` if not set.
+    ///
+    /// No authorization required — metadata is public.
+    pub fn get_metadata(env: Env, arena_id: u64) -> Option<ArenaMetadata> {
+        storage(&env).get(&DataKey::Metadata(arena_id))
     }
 
     pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ArenaError> {
@@ -1340,6 +1399,8 @@ fn bump(env: &Env, key: &DataKey) {
 mod abi_guard;
 #[cfg(all(test, feature = "integration-tests"))]
 mod integration_tests;
+#[cfg(test)]
+mod metadata_tests;
 #[cfg(test)]
 mod state_machine_tests;
 #[cfg(test)]
